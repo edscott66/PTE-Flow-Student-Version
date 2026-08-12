@@ -1,0 +1,89 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+
+    function isValidSprint(data) {
+      return data.hostId == request.auth.uid &&
+             data.hostName is string && data.hostName.size() <= 100 &&
+             data.status in ['waiting', 'active', 'finished', 'lobby', 'armed', 'running'] &&
+             data.ssid is string && data.ssid.size() <= 100;
+    }
+
+    function isValidResult(data) {
+      return data.userId == request.auth.uid &&
+             data.userName is string && data.userName.size() <= 100 &&
+             data.score is number && data.score >= 0 && data.score <= 1000 &&
+             data.timeTaken is number && data.timeTaken >= 0 && data.timeTaken <= 3000;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (request.auth.token.email == 'projectgazzy@gmail.com' || exists(/databases/$(database)/documents/admins/$(request.auth.uid)));
+    }
+
+    // Connection test path
+    match /test/connection {
+      allow read: if true;
+    }
+
+    // Config (Global Reset)
+    match /config/reset {
+      allow read: if true;
+      allow write: if isAdmin() || (isSignedIn() && incoming().adminSecret == 'BIGBEN2026');
+    }
+
+    // Verification Codes (Hardware/App activation)
+    match /verification_codes/{codeId} {
+      // Allow anyone to check if a code exists to facilitate activation flow
+      allow get: if true;
+      
+      // Only admins can list or manage codes
+      allow list: if isAdmin();
+      allow create, delete: if isAdmin() || (isSignedIn() && incoming().adminSecret == 'BIGBEN2026');
+      
+      // Allow users to mark a code as used when they activate
+      allow update: if isSignedIn() &&
+                    existing().isUsed == false &&
+                    incoming().isUsed == true && 
+                    incoming().diff(existing()).affectedKeys().hasOnly(['isUsed', 'usedBy', 'usedAt', 'deviceId']) &&
+                    incoming().usedBy == request.auth.uid;
+    }
+
+    // Leaderboard
+    match /leaderboard/{userId} {
+      allow read: if true;
+
+    // Allow anonymous users to write ONLY their own document
+      allow write: if isSignedIn() && request.auth.uid == userId;
+    }
+
+    // User Activations (Cloud recovery of subscription)
+    match /user_activations/{userId} {
+      allow read, write: if isSignedIn() && request.auth.uid == userId;
+    }
+
+    // Sprints & Results
+    match /sprints/{document=**} {
+      allow read: if true;
+      allow write: if isSignedIn();
+    }
+  }
+}

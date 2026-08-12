@@ -1,0 +1,1 @@
+app/daily-goals.tsx:              onPress={() => router.push({ pathname: `/module/${task.module_id || 'mock-exam'}`, params: { startIndex: 'random' } })}

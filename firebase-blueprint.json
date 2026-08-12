@@ -1,0 +1,80 @@
+{
+  "entities": {
+    "VerificationCode": {
+      "title": "Verification Code",
+      "description": "A secure activation code for subscriptions",
+      "type": "object",
+      "properties": {
+        "code": { "type": "string", "description": "The actual string of the code e.g. PTE-XYZ" },
+        "isUsed": { "type": "boolean" },
+        "daysGranted": { "type": "number", "description": "Number of days the code grants" },
+        "usedBy": { "type": "string", "description": "userId of the user who consumed the code" },
+        "usedAt": { "type": "number", "description": "Timestamp when the code was used" },
+        "createdAt": { "type": "number", "description": "Timestamp when the code was created" },
+        "createdBy": { "type": "string", "description": "Admin who created the code" }
+      },
+      "required": ["code", "isUsed", "daysGranted", "createdAt", "createdBy"]
+    },
+    "LeaderboardEntry": {
+      "title": "Leaderboard Entry",
+      "description": "A single entry in the global leaderboard",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "Unique ID for the user" },
+        "name": { "type": "string", "description": "Display name of the user" },
+        "score": { "type": "number", "description": "Total score of the user" },
+        "lastUpdate": { "type": "string", "format": "date-time", "description": "ISO timestamp of last update" },
+        "attemptedQuestions": { "type": "array", "items": { "type": "string" }, "description": "List of IDs for questions already scored" }
+      },
+      "required": ["userId", "name", "score", "lastUpdate"]
+    },
+    "Sprint": {
+      "title": "Live Sprint Session",
+      "description": "A Kahoot-style live session hosted by a teacher",
+      "type": "object",
+      "properties": {
+        "hostId": { "type": "string" },
+        "hostName": { "type": "string" },
+        "questionType": { "type": "string" },
+        "questionId": { "type": "string" },
+        "status": { "type": "string", "enum": ["waiting", "active", "finished"] },
+        "startTime": { "type": "number", "description": "Unix timestamp" },
+        "duration": { "type": "number", "description": "Seconds" },
+        "ssid": { "type": "string", "description": "Network SSID for proximity filtering" },
+        "createdAt": { "type": "number" }
+      },
+      "required": ["hostId", "hostName", "questionType", "questionId", "status", "ssid"]
+    },
+    "SprintResult": {
+      "title": "Sprint Result",
+      "description": "A single user's result in a sprint",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "userName": { "type": "string" },
+        "score": { "type": "number" },
+        "timeTaken": { "type": "number" },
+        "submittedAt": { "type": "number" }
+      },
+      "required": ["userId", "userName", "score", "timeTaken"]
+    }
+  },
+  "firestore": {
+    "/verification_codes/{codeId}": {
+      "schema": "VerificationCode",
+      "description": "Collection of verification codes"
+    },
+    "/leaderboard/{userId}": {
+      "schema": "LeaderboardEntry",
+      "description": "Collection of leaderboard entries keyed by userId"
+    },
+    "/sprints/{sprintId}": {
+      "schema": "Sprint",
+      "description": "Collection of active and past sprint sessions"
+    },
+    "/sprints/{sprintId}/results/{userId}": {
+      "schema": "SprintResult",
+      "description": "Results for a specific sprint session"
+    }
+  }
+}

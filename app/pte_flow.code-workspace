@@ -1,0 +1,25 @@
+{
+	"folders": [
+		{
+			"path": "../../Apps/ParkingReminderLatest"
+		},
+		{
+			"path": ".."
+		},
+		{
+			"path": "../../PTE_Can_Do/LearningTracker"
+		},
+		{
+			"path": "../../Classroom Seat Booking NEW"
+		},
+		{
+			"path": "../../Apps/BusinessResearch"
+		},
+		{
+			"path": "../../Apps/Skill Speak AI Coach"
+		}
+	],
+	"settings": {
+		"liveServer.settings.multiRootWorkspaceName": "Student Management Suite Exam Table"
+	}
+}

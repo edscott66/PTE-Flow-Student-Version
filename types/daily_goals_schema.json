@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "daily_goals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "task_name": { "type": "string" },
+          "skill_trained": { "type": "string" },
+          "why_it_matters_for_pte": { "type": "string" },
+          "estimated_time_minutes": { "type": "integer", "minimum": 1, "maximum": 4 }
+        },
+        "required": ["task_name", "skill_trained", "why_it_matters_for_pte", "estimated_time_minutes"]
+      },
+      "minItems": 3,
+      "maxItems": 5
+    },
+    "adaptive_adjustments": { "type": "string" },
+    "micro_feedback": { "type": "string" },
+    "progress_signals": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 3,
+      "maxItems": 5
+    },
+    "weekly_link": { "type": "string" }
+  },
+  "required": ["daily_goals", "adaptive_adjustments", "micro_feedback", "progress_signals", "weekly_link"]
+}

@@ -1,0 +1,6 @@
+{
+  "name": "PTE Flow",
+  "description": "An AI-powered exam preparation and study module application for mobile devices.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
