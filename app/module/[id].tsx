@@ -9,6 +9,7 @@ import { generateMockExam } from '../../utils/mockExamGenerator';
 import CustomLoader from '../../components/CustomLoader';
 import { useTheme } from '../../context/ThemeContext';
 import * as Haptics from 'expo-haptics';
+import { updateStudentActivity } from '../../services/studentActivityService';
 
 // Import All Data Files
 import { MULTIPLE_CHOICE_READING_SINGLE_QUESTIONS } from '../../constants/multipleChoiceReadingSingleData';
@@ -41,6 +42,7 @@ import { scoreService } from '../../services/scoreService';
 import { networkService } from '../../services/networkService';
 import { Config } from '../../constants/config';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { reportActivity } from "../../utils/reportActivity";
 
 const { width, height } = Dimensions.get('window');
 
@@ -562,6 +564,17 @@ export default function ModuleScreen() {
   const isFillBlanksListening = activeType === 'fill-blanks-listening'; 
   const isPersonalIntro = activeType === 'personal-intro';
 
+  // --- GLOBAL ACTIVITY HOOK ---
+  useEffect(() => {
+    globalThis.reportActivity = (activity: string) => {
+      updateStudentActivity(activity);
+    };
+
+    return () => {
+      globalThis.reportActivity = undefined;
+    };
+  }, []);
+
   // --- DATA LOADING ---
   useEffect(() => {
     let loaded: any[] =[]; 
@@ -883,6 +896,8 @@ export default function ModuleScreen() {
     }
   }, [currentIndex, questions.length, showIntroPopup, resetKey]);
   const handleDismissIntro = () => {
+    //Activity reporting: user dismissed intro popup
+    reportActivity("teal-start");
     setShowIntroPopup(false);
   };
 
@@ -890,6 +905,8 @@ export default function ModuleScreen() {
   // --- 5. AUTO PLAY AUDIO (With Safety Guards) ---
   // --- NEW: START FLOWS FOR GROUP / SITUATION ---
   const startTealFlow = (recordTime: number) => {
+    //Activity reporting: user started TEAL flow
+    reportActivity("teal-start");
       const currentQ = questions[currentIndex] || {};
       const txt = currentQ.transcript || currentQ.text || currentQ.situation || "Listen carefully.";
       
@@ -1046,6 +1063,8 @@ export default function ModuleScreen() {
   }
 
   const scrollToQuestion = (index: number) => {
+    //Activity reporting: user navigated directly to a question (manual jump)
+    reportActivity("navigate-scroll-to-question");
     if (id === 'mock-exam' && index < currentIndex) {
       // Generally don't allow going back in mock exam as it's one-way
       return; 
@@ -1082,6 +1101,8 @@ export default function ModuleScreen() {
   };
 
   const handleNext = () => {
+    //Activity reporting: user navigated to next question
+    reportActivity("navigate-next");
     if (id === 'mock-exam') {
       // Record score before moving
       const currentQScore = scoredQuestions[currentIndex] || 0;
@@ -1113,14 +1134,22 @@ export default function ModuleScreen() {
     }
   };
 
-  const handlePrev = () => { if (currentIndex > 0) scrollToQuestion(currentIndex - 1); };
+  const handlePrev = () => { 
+    //Activity reporting: user navigated to previous question
+    reportActivity("navigate-prev");
+    if (currentIndex > 0) scrollToQuestion(currentIndex - 1); };
 
   const handleResetQuestion = () => {
+    //Activity reporting: user reset current question
+    reportActivity("question-reset");
     setResetKey(prev => prev + 1);
   };
 
   // --- LOGIC FUNCTIONS ---
   const startASQSequence = () => {
+    //Activity reporting: user started ASQ audio sequence
+    reportActivity("start-asq-sequence");
+
     const currentQ = questions[currentIndex];
     
 
@@ -1143,6 +1172,9 @@ export default function ModuleScreen() {
   };
 
   const proceedToNextASQ = () => {
+    //Activity reporting: user moved to the next ASQ question
+    reportActivity("ext-asq");
+
     if (autoNextTimerRef.current) clearTimeout(autoNextTimerRef.current);
     setAsqResultPopup(false);
     if (currentIndex < questions.length - 1) {
@@ -1153,6 +1185,8 @@ export default function ModuleScreen() {
   };
 
    const startListeningMC = () => {
+    //Activity reporting: user started litening MC audio sequence
+    reportActivity("start-listening-mc");
     const currentQ = questions[currentIndex];
     
     speakText("Audio will begin in 10 seconds", () => {
@@ -1175,6 +1209,8 @@ export default function ModuleScreen() {
 
   // --- ADDED THIS NEW FUNCTION HERE ---
   const handleStopAudio = async () => {
+    // Activity reporting: user stopped audio playback reportActivity("stop-audio")
+    reportActivity("stop-audio");
     Speech.stop();
     if (sound) {
       try {
@@ -1188,6 +1224,8 @@ export default function ModuleScreen() {
   // ------------------------------------
 
   const handlePlayLFibAudio = () => {
+    //Activity reporting: user played LFIB audio
+    reportActivity("lfib-play-audio");
     const currentQ = questions[currentIndex];
     const onFinish = () => setMode('IDLE');
 
@@ -1202,6 +1240,8 @@ export default function ModuleScreen() {
   };
 
   async function startRecording(d: number) {
+    //Activity reporting: user started recording (Speaking task)
+    reportActivity("speaking-start-recording");
     if (mode === 'RECORDING' || mode === 'PROCESSING') return;
     
     try {
@@ -1269,6 +1309,8 @@ export default function ModuleScreen() {
   }
 
   async function stopRecording(activeRecording: Audio.Recording | null) {
+    //Activity reporting: user stopped recording (Speaking task)
+    reportActivity("speaking-stop-recording");
     stopTimer();
 
     const rec = activeRecording || recording;
@@ -1375,7 +1417,9 @@ export default function ModuleScreen() {
   }
 
   const handleRetry = async () => {
-  if (!lastRecordingUri) {
+    //Activity reporting: user retried a speaking question
+    reportActivity("speaking-retry");
+    if (!lastRecordingUri) {
     Alert.alert("No Recording Found", "Please record your answer again.");
     return;
   }
@@ -1448,12 +1492,18 @@ export default function ModuleScreen() {
 };
 
   function handleStartPrep() {
+    //Activity reporting: user started preparation timer (Describe Image Retell Lecture)
+    reportActivity("prep-start");
+
     setMode('PREP');
     const prepTime = isDescribeImage ? 25 : 40; 
     startTimer(prepTime, () => startRecording(40));
   }
   
   const handlePlayLecture = () => {
+    //Activity reporting: user played Retell Lecture Audio
+    reportActivity("play-lecture-audio");
+
     if (lecturePlayed || mode === 'PLAYING_AUDIO') return;
     const currentQ = questions[currentIndex];
 
@@ -1475,12 +1525,16 @@ export default function ModuleScreen() {
   };
 
   const handleSummaryChange = (text: string) => { 
+    //Activity reporting: user started typing a summary (fires only once per question)
+    reportActivity("summary-typing-start");
     setUserSummary(text); 
     const count = text.trim().split(/\s+/).filter(w => w.length > 0).length; 
     setWordCount(count); 
   };
 
   const submitSummary = async () => {
+    //Activity reporting: user sumitted a summary (Summarize Written / Summarize Spoken))
+    reportActivity("summary-submit");
     if (userSummary.trim() === "") {
       Alert.alert("Wait!", "Please complete the exercise before submitting your answers.");
       return;
@@ -1510,6 +1564,8 @@ export default function ModuleScreen() {
   };
 
   const handleEssaySubmit = async () => {
+    //Activity reporting: user sumitted essay)
+    reportActivity("essay-submit");
     if (userSummary.trim() === "") {
       Alert.alert("Wait!", "Please complete the exercise before submitting your answers.");
       return;
@@ -1544,7 +1600,9 @@ export default function ModuleScreen() {
     }
   };
 
-  const toggleOption = (id: string) => { 
+  const toggleOption = (id: string) => {
+    //Activity reporting: user selected an option in MCQ (includes Listening MC)
+    reportActivity("mcq-select"); 
     if(mcResult) return; 
     if (isMCSingle) {
        setSelectedOptions([id]);
@@ -1553,7 +1611,9 @@ export default function ModuleScreen() {
     }
   };
   
-  const submitMultipleChoice = () => { 
+  const submitMultipleChoice = () => {
+    //Activity reporting: user submitted a Multiple Choice Answer
+    reportActivity("mc-submit");  
     if (selectedOptions.length === 0) {
       Alert.alert("Wait!", "Please complete the exercise before submitting your answers.");
       return;
@@ -1580,8 +1640,20 @@ export default function ModuleScreen() {
     setMode('RESULT'); 
   };
   
-  const toggleSpeed = () => { if (playbackSpeed === 1.0) { setPlaybackSpeed(0.75); setShowSpeedWarning(true); } else { setPlaybackSpeed(1.0); } };
+  const toggleSpeed = () => { 
+    //Activity reporting: user toggled listening playback speed)
+    reportActivity("toggle-speed"); 
+    if (playbackSpeed === 1.0) { 
+      setPlaybackSpeed(0.75); 
+      setShowSpeedWarning(true); 
+    } else { 
+      setPlaybackSpeed(1.0); 
+    } 
+  };
   const handlePlayHighlight = () => {
+    //Activity reporting: user played audio for Highlight Incorrect words)
+    reportActivity("highlight-play-audio"); 
+
     // 1. If currently playing, STOP it
     if (mode === 'PLAYING_AUDIO') {
         Speech.stop();
@@ -1607,8 +1679,18 @@ export default function ModuleScreen() {
         speakText(currentQ.spokenText || currentQ.text, onFinish, playbackSpeed);
     }
   };
-  const toggleWordSelection = (i: number) => { if (highlightResult) return; if (selectedIndices.includes(i)) setSelectedIndices(p => p.filter(x => x!==i)); else setSelectedIndices(p => [...p, i]); };
+  const toggleWordSelection = (i: number) => {
+     //Activity reporting: user selected/deselected a word in Highlight Incorrect words
+    reportActivity("highlight-select-word"); 
+    if (highlightResult) return; 
+    if (selectedIndices.includes(i)) 
+      setSelectedIndices(p => p.filter(x => x!==i)); 
+    else 
+      setSelectedIndices(p => [...p, i]); };
+
   const submitHighlight = () => { 
+    //Activity reporting: user sumitted Highlight Incorrect words)
+    reportActivity("highlight-submit"); 
     if (selectedIndices.length === 0) {
       Alert.alert("Wait!", "Please complete the exercise before submitting your answers.");
       return;
@@ -1630,6 +1712,8 @@ export default function ModuleScreen() {
     setMode('RESULT'); 
   };
   const handlePlayDictation = () => {
+    //Activity reporting: user played audio from Write From Dictation)
+    reportActivity("dictation-play-audio"); 
     if (dictationPlayed) return; // Prevent playing multiple times if that's your rule
 
     const onFinish = () => {
@@ -1646,7 +1730,9 @@ export default function ModuleScreen() {
       speakText(currentItem.text, onFinish, playbackSpeed);
     }
   };
-  const submitDictation = () => { 
+  const submitDictation = () => {
+    //Activity reporting: user sumitted write from Dictation)
+    reportActivity("dictation-submit");  
     if (userSummary.trim() === "") {
       Alert.alert("Wait!", "Please complete the exercise before submitting your answers.");
       return;
@@ -1669,7 +1755,9 @@ export default function ModuleScreen() {
     setMode('RESULT'); 
   };
   
-  function handlePlayAudio() { 
+  function handlePlayAudio() {
+    //Activity reporting: user played audio (Repeat Sentence / Listening playback))
+    reportActivity("play-audio");  
     const currentQ = questions[currentIndex];
     if (currentQ.audioUrl) {
         if (isRepeatSentence) setMode('PLAYING_AUDIO');
@@ -1687,12 +1775,23 @@ export default function ModuleScreen() {
     }, playbackSpeed);  
   }
 
-  const handleSelectWord = (w: string) => { if(activeBlankIndex!==null) { const n = [...blankAnswers]; n[activeBlankIndex] = w; setBlankAnswers(n); setActiveBlankIndex(null); } };
-  const checkFillBlankAnswer = () => { 
+  const handleSelectWord = (w: string) => {
+    //Activity reporting: user selected a word for RW-FIB
+    reportActivity("rwfib-select-word"); 
+    if(activeBlankIndex!==null) { 
+      const n = [...blankAnswers]; 
+      n[activeBlankIndex] = w; 
+      setBlankAnswers(n); 
+      setActiveBlankIndex(null); } };
+
+  const checkFillBlankAnswer = () => {
+    //Activity reporting: user submitted a Fill-in-the-blank answer
+    reportActivity("fib-submit");  
     if (blankAnswers.some(a => a === null)) {
       Alert.alert("Wait!", "Please complete the exercise before submitting your answers.");
       return;
     }
+
     const c = questions[currentIndex].correctAnswers; let s = 0; blankAnswers.forEach((a, i) => { if(a === c[i]) s++; }); 
     const isCorrect = s === c.length;
     setScoredQuestions(prev => ({...prev, [currentIndex]: s/c.length})); 
@@ -1700,10 +1799,25 @@ export default function ModuleScreen() {
     setFillBlankScore({ score: s, max: c.length }); 
     setMode('RESULT'); 
   };
-  const addToAnswer = (t: string) => { if(reOrderScore) return; setJumbledList(p => p.filter(x => x!==t)); setUserOrder(p => [...p, t]); };
-  const returnToJumbled = (t: string) => { if(reOrderScore) return; setUserOrder(p => p.filter(x => x!==t)); setJumbledList(p => [...p, t]); };
+  const addToAnswer = (t: string) => {
+    //Activity reporting: user added a sentence to RW-Recorder answer
+    reportActivity("reorder-add");   
+    if(reOrderScore) return; 
+    setJumbledList(p => p.filter(x => x!==t)); 
+    setUserOrder(p => [...p, t]); };
+
+  const returnToJumbled = (t: string) => { 
+    //Activity reporting: user returned a sentence to RW-Reorder jumbled list
+    reportActivity("reorder-removed");  
+    if(reOrderScore) return; 
+    setUserOrder(p => p.filter(x => x!==t)); 
+    setJumbledList(p => [...p, t]); };
+
   const checkReOrderAnswer = () => {
-  const co = questions[currentIndex].sentences;
+    //Activity reporting: user submitted a RW-Recorder answer
+    reportActivity("reorder-submit"); 
+  
+    const co = questions[currentIndex].sentences;
   // Use userOrder or whatever your "Answer Box" state is called
   const currentUserOrder = userOrder || []; 
 
@@ -1731,23 +1845,57 @@ export default function ModuleScreen() {
   setMode('RESULT');
   console.log("Mode set to RESULT with score:", s);
 };
-  const handleRwChange = (text: string, index: number) => { const newAnswers = [...rwAnswers]; newAnswers[index] = text; setRwAnswers(newAnswers); };
+  const handleRwChange = (text: string, index: number) => { 
+    //Activity reporting: user typrd in RW-FIB
+    reportActivity("fwfib-type");
+    const newAnswers = [...rwAnswers]; 
+    newAnswers[index] = text; 
+    setRwAnswers(newAnswers); };
+
   const checkRwAnswer = () => { 
+    //Activity reporting: user submitted RW-FIB answer
+    reportActivity("rwfib-submit");
     if (rwAnswers.some(ans => !ans || ans.trim() === "")) {
       Alert.alert("Wait!", "Please complete the exercise before submitting your answers.");
       return;
     }
     const correct = questions[currentIndex].correctAnswers; let score = 0; rwAnswers.forEach((ans, index) => { if (ans.trim().toLowerCase() === correct[index].toLowerCase()) score++; }); const points = score / correct.length; setScoredQuestions(prev => ({...prev, [currentIndex]: points})); awardPointIfFirstAttempt(score === correct.length); setRwResult({ score, max: correct.length }); setMode('RESULT'); 
   };
-  const handleLFibChange = React.useCallback((text: string, index: number) => { setLFibAnswers(prev => { const newAnswers = [...prev]; newAnswers[index] = text; return newAnswers; }); }, []);
-  const checkLFibAnswer = () => { 
+
+  const handleLFibChange = React.useCallback((text: string, index: number) => { 
+     //Activity reporting: user typrd in L-FIB
+    reportActivity("lfib-type");
+    setLFibAnswers(prev => { const newAnswers = [...prev]; 
+      newAnswers[index] = text; return newAnswers; 
+    }); 
+  }, []);
+
+  const checkLFibAnswer = () => {
+    //Activity reporting: user submitted Listening FIB answer
+    reportActivity("lfib-submit");
+
     if (lFibAnswers.some(ans => !ans || ans.trim() === "")) {
       Alert.alert("Wait!", "Please complete the exercise before submitting your answers.");
       return;
     }
-    const correct = questions[currentIndex].correctAnswers; let score = 0; lFibAnswers.forEach((ans, index) => { if (ans.trim().toLowerCase() === correct[index].toLowerCase()) score++; }); const points = score / correct.length; setScoredQuestions(prev => ({...prev, [currentIndex]: points})); awardPointIfFirstAttempt(score === correct.length); setLFibResult({ score, max: correct.length }); setShowLFibPopup(true); setMode('RESULT'); 
+    const correct = questions[currentIndex].correctAnswers; 
+    let score = 0; 
+    
+    lFibAnswers.forEach((ans, index) => { 
+      if (ans.trim().toLowerCase() === correct[index].toLowerCase()) score++; }); 
+      
+      const points = score / correct.length; 
+      
+      setScoredQuestions(prev => ({...prev, [currentIndex]: points})); 
+      awardPointIfFirstAttempt(score === correct.length); 
+      
+      setLFibResult({ score, max: correct.length }); 
+      setShowLFibPopup(true); 
+      setMode('RESULT'); 
   };
   const handleSelectRwWord = (word: string) => {
+    //Activity reporting: user selected a word in RW-FIB
+    reportActivity("rwfib-select-word");
     if (activeRwBlankIndex !== null && !rwResult) {
       const newAnswers = [...rwAnswers];
       newAnswers[activeRwBlankIndex] = word;
@@ -2337,6 +2485,8 @@ export default function ModuleScreen() {
   );
 
   const startMockExam = () => {
+    //Activity reporting: user started mock exam
+    reportActivity("mockexam-start");
     setMockExamFlow('SECTION_INTRO');
     setCurrentSectionIndex(0);
     setQuestions(mockExamSections[0].questions);
@@ -2344,6 +2494,8 @@ export default function ModuleScreen() {
   };
 
   const startSection = () => {
+    //Activity reporting: user started mock exam section
+    reportActivity("mockexam-section-start");
     setTimeLeft(5);
     setMockExamFlow('SECTION_POPUP');
     startTimer(5, () => {

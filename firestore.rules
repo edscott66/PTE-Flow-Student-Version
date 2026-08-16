@@ -1,6 +1,7 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+
     // Default deny
     match /{document=**} {
       allow read, write: if false;
@@ -15,7 +16,9 @@ service cloud.firestore {
     }
 
     function isValidId(id) {
-      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+      return id is string &&
+             id.size() <= 128 &&
+             id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
     function incoming() { return request.resource.data; }
@@ -36,7 +39,9 @@ service cloud.firestore {
     }
 
     function isAdmin() {
-      return isSignedIn() && (request.auth.token.email == 'projectgazzy@gmail.com' || exists(/databases/$(database)/documents/admins/$(request.auth.uid)));
+      return isSignedIn() &&
+             (request.auth.token.email == 'projectgazzy@gmail.com' ||
+              exists(/databases/$(database)/documents/admins/$(request.auth.uid)));
     }
 
     // Connection test path
@@ -47,22 +52,20 @@ service cloud.firestore {
     // Config (Global Reset)
     match /config/reset {
       allow read: if true;
-      allow write: if isAdmin() || (isSignedIn() && incoming().adminSecret == 'BIGBEN2026');
+      allow write: if isAdmin() ||
+                    (isSignedIn() && incoming().adminSecret == 'BIGBEN2026');
     }
 
     // Verification Codes (Hardware/App activation)
     match /verification_codes/{codeId} {
-      // Allow anyone to check if a code exists to facilitate activation flow
       allow get: if true;
-      
-      // Only admins can list or manage codes
       allow list: if isAdmin();
-      allow create, delete: if isAdmin() || (isSignedIn() && incoming().adminSecret == 'BIGBEN2026');
-      
-      // Allow users to mark a code as used when they activate
+      allow create, delete: if isAdmin() ||
+                            (isSignedIn() && incoming().adminSecret == 'BIGBEN2026');
+
       allow update: if isSignedIn() &&
                     existing().isUsed == false &&
-                    incoming().isUsed == true && 
+                    incoming().isUsed == true &&
                     incoming().diff(existing()).affectedKeys().hasOnly(['isUsed', 'usedBy', 'usedAt', 'deviceId']) &&
                     incoming().usedBy == request.auth.uid;
     }
@@ -70,8 +73,12 @@ service cloud.firestore {
     // Leaderboard
     match /leaderboard/{userId} {
       allow read: if true;
+      allow write: if isSignedIn() && request.auth.uid == userId;
+    }
 
-    // Allow anonymous users to write ONLY their own document
+    // Student Activity Logging
+    match /students/{userId}/activity/{activityId} {
+      allow read: if isSignedIn() && request.auth.uid == userId;
       allow write: if isSignedIn() && request.auth.uid == userId;
     }
 
@@ -86,4 +93,5 @@ service cloud.firestore {
       allow write: if isSignedIn();
     }
   }
-}
+
+  }
