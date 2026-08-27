@@ -15,7 +15,7 @@ import { StatusBar } from 'expo-status-bar';
 import React, { useState, useEffect, useRef } from 'react';
 import { scoreService } from '../services/scoreService';
 import { db, auth, ensureAuth, enableAutoLogin, handleFirestoreError, OperationType } from '../services/firebase';
-import { doc, setDoc } from 'firebase/firestore';
+import { doc, setDoc, onSnapshot } from 'firebase/firestore'; // ✅ ADDED onSnapshot
 import { useTheme } from '../context/ThemeContext';
 
 export default function WelcomeScreen() {
@@ -24,10 +24,33 @@ export default function WelcomeScreen() {
   const [loading, setLoading] = useState(true);
   const { colors, isDark } = useTheme();
   const [isLoggingIn, setIsLoggingIn] = useState(false);
+  const [broadcastMessage, setBroadcastMessage] = useState<string | null>(null); // ✅ ADDED state
 
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const rotateAnim = useRef(new Animated.Value(0)).current;
 
+  // ✅ NEW: Listen for live broadcasts from Teacher Dashboard
+  useEffect(() => {
+    const unsubscribe = onSnapshot(doc(db, "live_broadcast", "single"), (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        if (data.active && data.message) {
+          setBroadcastMessage(data.message);
+          console.log("📢 Broadcast received:", data.message);
+        } else {
+          setBroadcastMessage(null);
+        }
+      } else {
+        setBroadcastMessage(null);
+      }
+    }, (error) => {
+      console.error("Broadcast listener error:", error);
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  // Original pulse animation effect (unchanged)
   useEffect(() => {
     let animationLoop: Animated.CompositeAnimation | null = null;
 
@@ -76,18 +99,15 @@ export default function WelcomeScreen() {
     outputRange: ['0deg', '360deg'],
   });
 
+  // Check if user already exists (unchanged)
   useEffect(() => {
     const checkUser = async () => {
       const savedName = await scoreService.getUserName();
-
-      // If a name exists, prefill it so the user sees their registered identity
       if (savedName) {
         setName(savedName);
       }
-
       setLoading(false);
     };
-
     checkUser();
   }, []);
 
@@ -139,18 +159,16 @@ export default function WelcomeScreen() {
     try {
       const existingName = await scoreService.getUserName();
 
-      // ⭐ NAME LOCK: if a name already exists, it must match
       if (existingName && existingName !== trimmedName) {
         Alert.alert(
-        "Name Locked",
-        "This device already has a registered user.\n\nTo use a different name, please go to Settings and tap 'Reset My Progress'.",
-        [{ text: "OK" }]
-      );
+          "Name Locked",
+          "This device already has a registered user.\n\nTo use a different name, please go to Settings and tap 'Reset My Progress'.",
+          [{ text: "OK" }]
+        );
         setIsLoggingIn(false);
         return;
       }
 
-      // First login OR same name as before
       await scoreService.setUserName(trimmedName);
       await syncWithLeaderboard(trimmedName);
       router.replace('/(tabs)/home');
@@ -177,6 +195,25 @@ export default function WelcomeScreen() {
       shadowOpacity: 0.2,
       shadowRadius: 20,
       elevation: 10,
+    },
+    // ✅ NEW broadcast banner styles
+    broadcastBanner: {
+      backgroundColor: '#2563eb',
+      padding: 12,
+      marginHorizontal: 16,
+      borderRadius: 8,
+      marginTop: 10,
+      position: 'absolute',
+      top: 10,
+      left: 16,
+      right: 16,
+      zIndex: 10,
+    },
+    broadcastText: {
+      color: '#fff',
+      fontSize: 14,
+      fontWeight: '600',
+      textAlign: 'center',
     },
     contentSection: {
       backgroundColor: colors.surface,
@@ -220,6 +257,13 @@ export default function WelcomeScreen() {
   return (
     <SafeAreaView style={dynamicStyles.container}>
       <StatusBar style="light" />
+
+      {/* ✅ NEW: Display broadcast banner if a message is active */}
+      {broadcastMessage && (
+        <View style={dynamicStyles.broadcastBanner}>
+          <Text style={dynamicStyles.broadcastText}>📢 {broadcastMessage}</Text>
+        </View>
+      )}
 
       <View style={dynamicStyles.heroSection}>
         <Animated.View

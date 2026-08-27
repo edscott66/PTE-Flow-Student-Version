@@ -50,16 +50,11 @@ service cloud.firestore {
       allow write: if isAdmin() || (isSignedIn() && incoming().adminSecret == 'BIGBEN2026');
     }
 
-    // Verification Codes (Hardware/App activation)
+    // Verification Codes
     match /verification_codes/{codeId} {
-      // Allow anyone to check if a code exists to facilitate activation flow
       allow get: if true;
-      
-      // Only admins can list or manage codes
       allow list: if isAdmin();
       allow create, delete: if isAdmin() || (isSignedIn() && incoming().adminSecret == 'BIGBEN2026');
-      
-      // Allow users to mark a code as used when they activate
       allow update: if isSignedIn() &&
                     existing().isUsed == false &&
                     incoming().isUsed == true && 
@@ -70,18 +65,41 @@ service cloud.firestore {
     // Leaderboard
     match /leaderboard/{userId} {
       allow read: if true;
-
-    // Allow anonymous users to write ONLY their own document
       allow write: if isSignedIn() && request.auth.uid == userId;
     }
 
-    // User Activations (Cloud recovery of subscription)
+    // User Activations
     match /user_activations/{userId} {
       allow read, write: if isSignedIn() && request.auth.uid == userId;
     }
 
     // Sprints & Results
     match /sprints/{document=**} {
+      allow read: if true;
+      allow write: if isSignedIn();
+    }
+
+    // ===== NEW RULES FOR BROADCAST =====
+    // Live Broadcast
+    match /live_broadcast/{broadcastId} {
+      allow read: if true;
+      allow write: if isSignedIn();
+    }
+
+    // Leaderboard Broadcast
+    match /leaderboard_broadcast/{broadcastId} {
+      allow read: if true;
+      allow write: if isSignedIn();
+    }
+
+    // Class Settings
+    match /class_settings/{classId} {
+      allow read: if true;
+      allow write: if isSignedIn();
+    }
+
+    // Classes
+    match /classes/{classId} {
       allow read: if true;
       allow write: if isSignedIn();
     }

@@ -1,9 +1,8 @@
 {
-  "apiKey": "AIzaSyCjEzaUO0WM4fhmsNBABovy9bOMNnTpajA",
-  "authDomain": "pte-flow.firebaseapp.com",
-  "projectId": "pte-flow",
-  "storageBucket": "pte-flow.firebasestorage.app",
-  "messagingSenderId": "134570533295",
-  "appId": "1:134570533295:web:de301896c096f46607cf5a",
-  "measurementId": "G-2VVVMV5N7S"
+  "apiKey": "AIzaSyDX2QcapnWu0iq_9dUi78o4IPXdw7lzG1M",
+  "authDomain": "bba-web-e1884.firebaseapp.com",
+  "projectId": "bba-web-e1884",
+  "storageBucket": "bba-web-e1884.firebasestorage.app",
+  "messagingSenderId": "716224766880",
+  "appId": "1:716224766880:web:ba7ff4725f007af197fac5"
 }
