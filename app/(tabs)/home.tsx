@@ -9,7 +9,7 @@ import * as Haptics from 'expo-haptics';
 import { generateDailyGoals } from '../../logic/daily_goals_engine';
 // ─── FIXED: added Firebase imports to restore scores from cloud on load ───────
 import { db, auth } from '../../services/firebase';
-import { doc, getDoc } from 'firebase/firestore';
+import { doc, getDoc, onSnapshot } from 'firebase/firestore'; // Added onSnapshot
 import AsyncStorage from '@react-native-async-storage/async-storage';
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -61,6 +61,10 @@ export default function HomeScreen() {
   const [totalGoalQuestions, setTotalGoalQuestions] = useState(1);
   const { colors, isDark } = useTheme();
 
+  // ─── NEW: Broadcast state ──────────────────────────────────────────────
+  const [broadcastMessage, setBroadcastMessage] = useState<string | null>(null);
+  // ────────────────────────────────────────────────────────────────────────
+
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const waveAnim = useRef(new Animated.Value(0)).current;
 
@@ -110,6 +114,28 @@ export default function HomeScreen() {
     loadUser();
   }, []);
 
+  // ─── NEW: Broadcast listener ──────────────────────────────────────────
+  useEffect(() => {
+    const unsubscribe = onSnapshot(doc(db, "live_broadcast", "single"), (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        if (data.active && data.message) {
+          setBroadcastMessage(data.message);
+          console.log("📢 Broadcast received on Home screen:", data.message);
+        } else {
+          setBroadcastMessage(null);
+        }
+      } else {
+        setBroadcastMessage(null);
+      }
+    }, (error) => {
+      console.error("Broadcast listener error:", error);
+    });
+
+    return () => unsubscribe();
+  }, []);
+  // ────────────────────────────────────────────────────────────────────────
+
   useFocusEffect(
     useCallback(() => {
       const loadData = async () => {
@@ -125,14 +151,6 @@ export default function HomeScreen() {
         const mistakes = await scoreService.getMistakes();
         setMistakeCount(mistakes.length);
 
-        // ─── FIXED ────────────────────────────────────────────────────────────
-        // Previously: read cfa/ffa from AsyncStorage only. After logout,
-        // clearAllLocalData() wiped AsyncStorage so both returned 0 even though
-        // Firebase held the real scores. Now: if both are zero AND a Firebase
-        // user is signed in, we fetch the cloud score and restore it locally
-        // before displaying — so the home screen always shows the correct totals
-        // immediately on load rather than catching up after a few questions.
-        // ─────────────────────────────────────────────────────────────────────
         let correctFirsts = await scoreService.getCorrectFirstAttempts();
         let failedFirsts = await scoreService.getFailedFirstAttempts();
 
@@ -146,8 +164,6 @@ export default function HomeScreen() {
               const data = snap.data();
               const cloudScore = data.score || 0;
               if (cloudScore > 0) {
-                // Restore cloud score into local storage so subsequent reads
-                // are instant and don't need another network round-trip.
                 await scoreService.setScore(cloudScore);
                 await scoreService.setCorrectFirstAttempts(cloudScore);
                 correctFirsts = cloudScore;
@@ -157,7 +173,6 @@ export default function HomeScreen() {
             console.warn('[Home] Could not fetch score from Firebase:', e);
           }
         }
-        // ─────────────────────────────────────────────────────────────────────
 
         setCfa(correctFirsts);
         setFfa(failedFirsts);
@@ -197,6 +212,23 @@ export default function HomeScreen() {
     userName: { fontSize: 24, fontWeight: 'bold', color: colors.text },
     profileButton: { width: 48, height: 48, borderRadius: 24, overflow: 'hidden', justifyContent: 'center', alignItems: 'center', backgroundColor: colors.surface },
     avatarImage: { width: '100%', height: '100%', borderRadius: 24 },
+
+    // ─── NEW: broadcast banner styles ──────────────────────────────────
+    broadcastBanner: {
+      backgroundColor: '#2563eb',
+      padding: 12,
+      marginHorizontal: 16,
+      borderRadius: 8,
+      marginTop: 10,
+      marginBottom: 10,
+    },
+    broadcastText: {
+      color: '#fff',
+      fontSize: 14,
+      fontWeight: '600',
+      textAlign: 'center',
+    },
+    // ────────────────────────────────────────────────────────────────────
 
     progressReportCard: {
       backgroundColor: colors.surface,
@@ -319,6 +351,14 @@ export default function HomeScreen() {
 
   return (
     <SafeAreaView style={dynamicStyles.container}>
+      {/* ─── NEW: Broadcast banner ─────────────────────────────────────── */}
+      {broadcastMessage && (
+        <View style={dynamicStyles.broadcastBanner}>
+          <Text style={dynamicStyles.broadcastText}>📢 {broadcastMessage}</Text>
+        </View>
+      )}
+      {/* ──────────────────────────────────────────────────────────────────── */}
+
       <ScrollView contentContainerStyle={dynamicStyles.scroll}>
 
         {/* Header with User Name */}

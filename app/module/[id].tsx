@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useState, useRef, useMemo } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, Alert, Dimensions, FlatList, Image, Modal, ScrollView, TextInput, Keyboard, KeyboardAvoidingView, Platform, TouchableWithoutFeedback } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { Audio } from 'expo-av';
@@ -32,10 +32,10 @@ import { LISTENING_FILL_BLANKS_QUESTIONS } from '../../constants/listeningFillBl
 import { SELECT_MISSING_WORD_QUESTIONS } from '../../constants/selectMissingWordData';
 import { HIGHLIGHT_CORRECT_SUMMARY_QUESTIONS } from '../../constants/highlightCorrectSummaryData';
 import { ESSAY_QUESTIONS } from '../../constants/essayData';
-import { SUMMARIZE_GROUP_QUESTIONS } from '../../constants/summarizeGroupData'; 
+import { SUMMARIZE_GROUP_QUESTIONS } from '../../constants/summarizeGroupData';
 import { RESPOND_SITUATION_QUESTIONS } from '../../constants/respondSituationData';
 import { db, auth, ensureAuth, handleFirestoreError, OperationType } from '../../services/firebase';
-import { collection, doc, setDoc, query, orderBy, limit, getDocs, where, increment, updateDoc } from 'firebase/firestore';
+import { collection, doc, setDoc, query, orderBy, limit, getDocs, where, increment, updateDoc, onSnapshot } from 'firebase/firestore';
 import { analyzeSpeech, analyzeWriting, synthesizeSpeech } from '../../services/geminiService';
 import { scoreService } from '../../services/scoreService';
 import { networkService } from '../../services/networkService';
@@ -88,6 +88,48 @@ const CATEGORIES: Record<string, { title: string, tasks: { id: string, title: st
       { id: 'write-dictation', title: 'Write From Dictation', icon: 'keyboard' },
     ]
   }
+};
+
+// Helper: convert hyphenated ID to camelCase (e.g., "read-aloud" → "readAloud")
+const toCamelCase = (str: string) => {
+  return str.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+};
+
+// ----- LOCK MAPPING: Map task IDs (used in navigation) to Firestore keys -----
+const FIREBASE_KEY_MAP: Record<string, string> = {
+  'read-aloud': 'readAloud',
+  'repeat-sentence': 'repeatSentence',
+  'describe-image': 'describeImage',
+  'retell-lecture': 'retellLecture',
+  'summarize-group-discussion': 'summarizeGroupDiscussion',
+  'respond-to-situation': 'respondSituation',
+  'answer-short-question': 'answerShortQuestion',
+  'personal-intro': 'personalIntroduction',
+  'summarize-written': 'summarizeWrittenText',
+  'essay': 'essay',
+  'fill-blanks-rw': 'fillBlanksRW',
+  'multiple-choice': 'multipleChoiceMultiple',
+  're-order-paragraphs': 'reorderParagraphs',
+  'fill-blanks': 'fillBlanks',
+  'multiple-choice-r-single': 'multipleChoiceSingle',
+  'summarize-spoken': 'summarizeSpokenText',
+  'multiple-choice-l-multi': 'multipleChoiceMultipleListen',
+  'fill-blanks-listening': 'fillBlanksListen',
+  'highlight-correct-summary': 'highlightCorrectSummary',
+  'multiple-choice-l-single': 'multipleChoiceSingleListen',
+  'select-missing-word': 'selectMissingWord',
+  'highlight-incorrect': 'highlightIncorrect',
+  'write-dictation': 'writeDictation',
+  'mock-exam': 'fullMockTest',
+  'custom-mock': 'customMockTest'
+};
+
+/**
+ * Returns the Firestore key for a given task ID.
+ * Uses the mapping above; if not found, falls back to camelCase.
+ */
+const getFirestoreKey = (taskId: string): string => {
+  return FIREBASE_KEY_MAP[taskId] || toCamelCase(taskId);
 };
 
 type TimerMode = 'IDLE' | 'PLAYING_AUDIO' | 'PREP' | 'PREP_RETELL' | 'PREP_LISTENING' | 'RECORDING' | 'PROCESSING' | 'RESULT' | 'WAITING_NEXT';
@@ -214,10 +256,25 @@ const ListeningFillBlanksContent = React.memo(({ item, lFibAnswers, lFibResult, 
 });
 
 export default function ModuleScreen() {
-  const { id, startIndex, customConfig } = useLocalSearchParams();
+  const params = useLocalSearchParams();
   const router = useRouter();
   const { colors, isDark } = useTheme();
 
+  // Normalise Expo Router parameters to simple string values.
+  const id = Array.isArray(params.id) ? params.id[0] : (params.id ?? '');
+  const startIndex = Array.isArray(params.startIndex)
+    ? params.startIndex[0]
+    : params.startIndex;
+  const customConfig = Array.isArray(params.customConfig)
+    ? params.customConfig[0]
+    : params.customConfig;
+
+  const isCustomMockExam =
+    typeof customConfig === 'string' && customConfig.trim().length > 0;
+  // ----- activity settings for locks -----
+  const moduleInfo = MODULES.find(m => m.id === id);
+
+  // ----- STYLES DEFINITION (must be before lock check) -----
   const styles = React.useMemo(() => StyleSheet.create({
     container: { flex: 1, backgroundColor: colors.background },
     centerContainer: { flex: 1, justifyContent: 'center', alignItems: 'center' },
@@ -357,19 +414,156 @@ export default function ModuleScreen() {
     dropdownItemText: { fontSize: 16, color: colors.text, textAlign: 'center' },
     dropdownCloseBtn: { marginTop: 20, backgroundColor: isDark ? colors.border : '#F1F5F9', padding: 14, borderRadius: 12, alignItems: 'center' },
     dropdownCloseText: { color: colors.text, fontWeight: 'bold', fontSize: 16 },
+    lockedTask: {
+      opacity: 0.6,
+      borderColor: '#ef4444',
+      borderWidth: 1,
+    },
+    lockIcon: {
+      marginLeft: 'auto',
+      color: '#ef4444',
+      fontSize: 18,
+    },
+    lockedText: {
+      color: '#9ca3af',
+    },
+    lockOverlay: {
+      flex: 1,
+      justifyContent: 'center',
+      alignItems: 'center',
+      padding: 40,
+    },
+    lockOverlayText: {
+      fontSize: 18,
+      color: '#ef4444',
+      fontWeight: '600',
+      textAlign: 'center',
+    },
   }), [colors, isDark]);
 
-  const FeedbackRow = ({label, text, isIncorrect}: {label: string, text: string, isIncorrect?: boolean}) => (
-    <View style={{marginBottom: 8, width: '100%', borderBottomWidth: 1, borderBottomColor: isIncorrect ? '#FECACA' : colors.border, paddingBottom: 4}}>
-       <Text style={{fontWeight: 'bold', color: isIncorrect ? '#991B1B' : colors.text, fontSize: 14}}>{label}</Text>
-       <Text style={{color: isIncorrect ? '#7F1D1D' : colors.subtext, fontSize: 13}}>{text}</Text>
-    </View>
-  );
+  // ---- ALL HOOKS: every hook runs unconditionally on every render ----
+  const [activitySettings, setActivitySettings] = useState<Record<string, boolean>>({});
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
 
-  // 1. STATE DEFINITIONS
+  // Listen to Firestore for lock/unlock settings
+  useEffect(() => {
+    const unsubscribe = onSnapshot(
+      doc(db, "settings", "activitySettings"),
+      (docSnap) => {
+        if (docSnap.exists()) {
+          const data = docSnap.data();
+          console.log("🔒 Activity settings loaded:", data);
+          setActivitySettings(data);
+        } else {
+          const defaults: Record<string, boolean> = {};
+          Object.values(CATEGORIES).forEach(cat => {
+            cat.tasks.forEach(task => {
+              defaults[getFirestoreKey(task.id)] = true;
+            });
+          });
+          setActivitySettings(defaults);
+        }
+        setSettingsLoaded(true);
+      },
+      (error) => {
+        console.error("Error loading activity settings:", error);
+        setSettingsLoaded(true);
+      }
+    );
+    return () => unsubscribe();
+  }, []);
+
+  // ----- Guard: if this is a specific task and it's locked, prevent access -----
+  useEffect(() => {
+  if (!settingsLoaded) return;
+      const taskId = id;
+
+      // Custom Mock is always available. It uses the same mock-exam engine,
+      // but it must NOT inherit the teacher-controlled Full Mock lock.
+      const bypassTeacherLock = taskId === 'custom-mock' || (taskId === 'mock-exam' && isCustomMockExam);
+
+      if (taskId && !CATEGORIES[taskId] && taskId !== 'mistakes' && !bypassTeacherLock) {
+        const firestoreKey = getFirestoreKey(taskId);
+        if (activitySettings[firestoreKey] === false) {
+          Alert.alert("Locked", "This task is currently locked by your teacher.");
+          router.back();
+        }
+      }
+    }, [activitySettings, id, settingsLoaded, isCustomMockExam, router]);
   const [questions, setQuestions] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
-  const [currentIndex, setCurrentIndex] = useState(startIndex ? parseInt(startIndex as string, 10) : 0);
+
+  useEffect(() => {
+    console.log("ModuleScreen data loading for id:", id);
+    let loaded: any[] = [];
+    if (id === 'mock-exam') {
+        // Full Mock uses the default configuration. Custom Mock supplies
+        // customConfig and uses the exact same exam engine.
+        try {
+          const sections = generateMockExam(customConfig);
+          console.log(
+            isCustomMockExam
+              ? 'Loaded Custom Mock configuration:'
+              : 'Loaded Full Mock configuration:',
+            customConfig || 'default'
+          );
+          setMockExamSections(sections);
+          setQuestions([]);
+        } catch (e) {
+          console.error('Mock Exam generation error:', e);
+          setMockExamSections([]);
+          setQuestions([]);
+        }
+        setMockExamFlow('MAIN_INTRO');
+        setLoading(false);
+        return;
+      }
+    if (id === 'mistakes') {
+      const loadMistakes = async () => {
+        const mistakes = await scoreService.getMistakes();
+        if (mistakes.length === 0) {
+          Alert.alert("Empty Bank", "You don't have any mistakes to review yet. Good job!");
+          router.back();
+          return;
+        }
+        setQuestions(mistakes);
+        setLoading(false);
+      };
+      loadMistakes();
+      return;
+    }
+
+    const dataMap: Record<string, any[]> = {
+      'read-aloud': READ_ALOUD_QUESTIONS,
+      'repeat-sentence': REPEAT_SENTENCE_QUESTIONS,
+      'describe-image': DESCRIBE_IMAGE_QUESTIONS,
+      're-order-paragraphs': REORDER_PARAGRAPHS_QUESTIONS,
+      'fill-blanks': FILL_BLANKS_QUESTIONS,
+      'summarize-spoken': SUMMARIZE_SPOKEN_QUESTIONS,
+      'write-dictation': WRITE_DICTATION_QUESTIONS,
+      'highlight-incorrect': HIGHLIGHT_INCORRECT_QUESTIONS,
+      'multiple-choice': MULTIPLE_CHOICE_QUESTIONS,
+      'multiple-choice-r-single': MULTIPLE_CHOICE_READING_SINGLE_QUESTIONS,
+      'summarize-written': SUMMARIZE_WRITTEN_QUESTIONS,
+      'retell-lecture': RETELL_LECTURE_QUESTIONS,
+      'answer-short-question': ANSWER_SHORT_QUESTION_DATA,
+      'fill-blanks-rw': FILL_BLANKS_RW_QUESTIONS,
+      'highlight-correct-summary': HIGHLIGHT_CORRECT_SUMMARY_QUESTIONS,
+      'select-missing-word': SELECT_MISSING_WORD_QUESTIONS,
+      'essay': ESSAY_QUESTIONS,
+      'summarize-group-discussion': SUMMARIZE_GROUP_QUESTIONS,
+      'respond-to-situation': RESPOND_SITUATION_QUESTIONS,
+      'multiple-choice-l-single': MULTIPLE_CHOICE_SINGLE_QUESTIONS,
+      'multiple-choice-l-multi': MULTIPLE_CHOICE_LISTENING_MULTI_QUESTIONS,
+      'fill-blanks-listening': LISTENING_FILL_BLANKS_QUESTIONS,
+      'personal-intro': [{ id: 'pi1', type: 'personal-intro', prompt: 'Please introduce yourself. This is not scored but will be sent to institutions.' }],
+    };
+    loaded = dataMap[id] || [];
+    console.log("Loaded questions count:", loaded.length);
+    setQuestions(loaded);
+    setLoading(false);
+  }, [id, startIndex, customConfig]);
+  const [currentIndex, setCurrentIndex] = useState(0);
   const [bestScores, setBestScores] = useState<{[key: number]: number}>({});
   const [scoreFeedback, setScoreFeedback] = useState<{message: string, type: 'success' | 'info' | 'error'} | null>(null);
 
@@ -378,6 +572,217 @@ export default function ModuleScreen() {
   const [currentSectionIndex, setCurrentSectionIndex] = useState(0);
   const [mockExamFlow, setMockExamFlow] = useState<'MAIN_INTRO' | 'SECTION_INTRO' | 'SECTION_POPUP' | 'IN_PROGRESS' | 'FINAL_RESULTS'>('MAIN_INTRO');
   const [sectionScores, setSectionScores] = useState<Record<string, number[]>>({});
+  const [mode, setMode] = useState<TimerMode>('IDLE');
+  const [timeLeft, setTimeLeft] = useState(0);
+  const [recording, setRecording] = useState<Audio.Recording | null>(null);
+  const [result, setResult] = useState<any>(null);
+  const [showModelAnswer, setShowModelAnswer] = useState(false);
+  const [sound, setSound] = useState<Audio.Sound | null>(null);
+  const [lastRecordingUri, setLastRecordingUri] = useState<string | null>(null);
+
+  // --- MODULE SPECIFIC STATE ---
+  const [jumbledList, setJumbledList] = useState<string[]>([]);
+  const [userOrder, setUserOrder] = useState<string[]>([]);
+  const [reOrderScore, setReOrderScore] = useState<{score: number, max: number} | null>(null);
+  
+  const [blankAnswers, setBlankAnswers] = useState<string[]>([]);
+  const [activeBlankIndex, setActiveBlankIndex] = useState<number | null>(null); 
+  const [activeRwBlankIndex, setActiveRwBlankIndex] = useState<number | null>(null);
+  const [fillBlankScore, setFillBlankScore] = useState<{score: number, max: number} | null>(null);
+  
+  const [userSummary, setUserSummary] = useState("");
+  const [wordCount, setWordCount] = useState(0);
+  const [isSummarizePlaying, setIsSummarizePlaying] = useState(false);
+  const [dictationPlayed, setDictationPlayed] = useState(false);
+  const [dictationResult, setDictationResult] = useState<any>(null);
+  const [selectedIndices, setSelectedIndices] = useState<number[]>([]);
+  const [playbackSpeed, setPlaybackSpeed] = useState(1.0);
+  const [showSpeedWarning, setShowSpeedWarning] = useState(false);
+  const [highlightResult, setHighlightResult] = useState<any>(null);
+  const [selectedOptions, setSelectedOptions] = useState<string[]>([]);
+  const [mcResult, setMcResult] = useState<any>(null);
+  const [lecturePlayed, setLecturePlayed] = useState(false);
+  const [isKeyboardVisible, setKeyboardVisible] = useState(false);
+  const [showSpeakNow, setShowSpeakNow] = useState(false);
+  const [showIntroPopup, setShowIntroPopup] = useState(true);
+  const [resetKey, setResetKey] = useState(0);
+  const [hideInstruction, setHideInstruction] = useState(false);
+  const startTimeRef = useRef<number>(Date.now());
+  const [asqResultPopup, setAsqResultPopup] = useState(false);
+  const [rwAnswers, setRwAnswers] = useState<string[]>([]);
+  const [rwResult, setRwResult] = useState<{score: number, max: number} | null>(null);
+  const [lFibAnswers, setLFibAnswers] = useState<string[]>([]);
+  const [lFibResult, setLFibResult] = useState<{score: number, max: number} | null>(null);
+  const [showLFibPopup, setShowLFibPopup] = useState(false);
+
+  const [isImageViewVisible, setIsImageViewVisible] = useState(false);
+  const [currentZoomImage, setCurrentZoomImage] = useState<any>(null);
+
+  const [voiceId, setVoiceId] = useState<string | null>(null);
+  const [isVoiceReady, setIsVoiceReady] = useState(false);
+  const [isGeneratingTTS, setIsGeneratingTTS] = useState(false);
+  const [scoredQuestions, setScoredQuestions] = useState<Record<number, number>>({});
+  const flatListRef = useRef<FlatList>(null);
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const timeLeftRef = useRef<number>(0);
+  const totalTimeRef = useRef<number>(0);
+  const autoNextTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const handleLFibChange = React.useCallback((text: string, index: number) => { setLFibAnswers(prev => { const newAnswers = [...prev]; newAnswers[index] = text; return newAnswers; }); }, []);
+  useEffect(() => {
+    if (id && id !== 'mock-exam' && moduleInfo && questions.length > 0) {
+      const hasAnsweredCurrent = scoredQuestions[currentIndex] !== undefined || mode === 'RESULT';
+      const resumeIndex = hasAnsweredCurrent 
+        ? Math.min(currentIndex + 1, questions.length - 1) 
+        : currentIndex;
+
+      scoreService.setRecentActivity({
+        moduleId: id as string,
+        moduleTitle: moduleInfo.title,
+        questionIndex: resumeIndex,
+        timestamp: new Date().toISOString()
+      });
+    }
+  }, [id, currentIndex, scoredQuestions, mode, questions.length, moduleInfo]);
+  useEffect(() => {
+    (async () => {
+      await Audio.requestPermissionsAsync();
+      await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
+    })();
+
+    const getVoices = async (retries = 3) => {
+      try {
+        const voices = await Speech.getAvailableVoicesAsync();
+        
+        if (voices.length === 0 && retries > 0) {
+            setTimeout(() => getVoices(retries - 1), 800);
+            return;
+        }
+
+        let bestVoice = voices.find(v => v.identifier.includes("Daniel") || v.identifier.includes("Arthur")); 
+        if (!bestVoice) bestVoice = voices.find(v => v.identifier.includes('en-gb') && (v.identifier.includes('rjs-local') || v.identifier.includes('gbd-local')));
+        if (!bestVoice) bestVoice = voices.find(v => v.identifier.includes('en-gb') && v.identifier.includes('local'));
+        if (!bestVoice) bestVoice = voices.find(v => v.language.includes('en-GB'));
+        
+        if (bestVoice) setVoiceId(bestVoice.identifier);
+      } catch (e) {
+        console.log("Error loading voices");
+      }
+      setIsVoiceReady(true);
+    };
+    getVoices();
+
+    const keyboardShow = Keyboard.addListener(Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow', () => setKeyboardVisible(true));
+    const keyboardHide = Keyboard.addListener(Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide', () => setKeyboardVisible(false));
+
+    return () => { 
+      stopTimer(); 
+      Speech.stop(); 
+      if (autoNextTimerRef.current) clearTimeout(autoNextTimerRef.current);
+      keyboardShow.remove();
+      keyboardHide.remove();
+
+      const endTime = Date.now();
+      const elapsedMs = endTime - startTimeRef.current;
+      const elapsedMins = Math.floor(elapsedMs / (1000 * 60));
+      if (elapsedMins > 0) {
+        scoreService.addStudyTime(Math.min(elapsedMins, 120));
+      }
+    };
+  }, []);
+  useEffect(() => {
+    if (showIntroPopup) return;
+
+    stopTimer();
+    Speech.stop();
+    if(sound) { sound.unloadAsync(); setSound(null); }
+
+    if (questions.length > 0 && currentItem) {
+      setMode('IDLE'); setResult(null); setTimeLeft(0); setUserSummary(""); setWordCount(0);
+      setHideInstruction(false);
+      setSelectedOptions([]); setSelectedIndices([]); setRwAnswers([]); setLFibAnswers([]);
+      setBlankAnswers([]); setUserOrder([]); setJumbledList([]); 
+      setReOrderScore(null); setFillBlankScore(null);
+      setDictationResult(null); setHighlightResult(null); setMcResult(null); setRwResult(null);
+      setLFibResult(null); setLecturePlayed(false); setDictationPlayed(false); setIsSummarizePlaying(false);
+      setIsImageViewVisible(false); setCurrentZoomImage(null);
+      setAsqResultPopup(false);
+      setShowSpeakNow(false);
+      
+      if (isReOrder && currentItem.sentences) {
+        setJumbledList([...currentItem.sentences].sort(() => Math.random() - 0.5));
+      } 
+      if (isFillBlanks && currentItem.correctAnswers) {
+        setBlankAnswers(new Array(currentItem.correctAnswers.length).fill(null));
+      } 
+      if (isFillBlanksRW && currentItem.correctAnswers) {
+        setRwAnswers(new Array(currentItem.correctAnswers.length).fill(""));
+      } 
+      if (isFillBlanksListening && currentItem.correctAnswers) {
+        setLFibAnswers(new Array(currentItem.correctAnswers.length).fill(""));
+      } 
+      if (isEssay) {
+         setTimeout(() => startTimer(1200, () => handleEssaySubmit()), 500); 
+      } 
+      if (isPersonalIntro) {
+         setMode('IDLE');
+      }
+    }
+  }, [currentIndex, questions.length, showIntroPopup, resetKey]);
+  useEffect(() => {
+    return () => {
+      if (sound) sound.unloadAsync();
+    };
+  }, [sound]);
+
+  useEffect(() => {
+    return () => {
+      if (recording) {
+        recording.stopAndUnloadAsync().catch((e) => console.log("Silent unload catch:", e));
+      }
+    };
+  }, [recording]);
+
+  // 2. ACTIVE TYPE DEFINITION
+  const currentItem = questions[currentIndex] || {};
+  const activeType = (id === 'essay') ? 'essay' : (currentItem.type || currentItem.moduleType || id);
+  
+  // --- IDENTIFY MODULES ---
+  const isReadAloud = activeType === 'read-aloud';
+  const isRepeatSentence = activeType === 'repeat-sentence';
+  const isDescribeImage = activeType === 'describe-image';
+  const isReOrder = activeType === 're-order-paragraphs';
+  const isFillBlanks = activeType === 'fill-blanks'; 
+  const isSummarizeSpoken = activeType === 'summarize-spoken';
+  const isWriteDictation = activeType === 'write-dictation';
+  const isHighlightIncorrect = activeType === 'highlight-incorrect';
+  const isMultipleChoice = activeType === 'multiple-choice';
+  const isSelectMissingWord = activeType === 'select-missing-word';
+  const isHighlightCorrectSummary = activeType === 'highlight-correct-summary'; 
+  const isEssay = activeType === 'essay'; 
+  const isSummarizeGroup = activeType === 'summarize-group-discussion'; 
+  const isRespondSituation = activeType === 'respond-to-situation'; 
+  
+  // Grouping Logic
+  const isMCSingle = activeType === 'multiple-choice-r-single' || activeType === 'multiple-choice-l-single' || activeType === 'highlight-correct-summary' || activeType === 'select-missing-word';
+  const isMCListeningMulti = activeType === 'multiple-choice-l-multi'; 
+  const isAnyMC = isMultipleChoice || isMCSingle || isMCListeningMulti;
+  const isSummarizeWritten = activeType === 'summarize-written';
+  const isRetellLecture = activeType === 'retell-lecture';
+  const isASQ = activeType === 'answer-short-question';
+  const isFillBlanksRW = activeType === 'fill-blanks-rw'; 
+  const isFillBlanksListening = activeType === 'fill-blanks-listening'; 
+  const isPersonalIntro = activeType === 'personal-intro';
+  
+  const currentSessionScore = Object.values(scoredQuestions).reduce((sum, val) => sum + val, 0);
+  const isPlayingAudio = mode === 'PLAYING_AUDIO';
+
+const FeedbackRow = ({label, text, isIncorrect}: {label: string, text: string, isIncorrect?: boolean}) => (
+    <View style={{marginBottom: 8, width: '100%', borderBottomWidth: 1, borderBottomColor: isIncorrect ? '#FECACA' : colors.border, paddingBottom: 4}}>
+       <Text style={{fontWeight: 'bold', color: isIncorrect ? '#991B1B' : colors.text, fontSize: 14}}>{label}</Text>
+       <Text style={{color: isIncorrect ? '#7F1D1D' : colors.subtext, fontSize: 13}}>{text}</Text>
+    </View>
+  );
+
 
   const showFeedback = (message: string, type: 'success' | 'info' | 'error') => {
     setScoreFeedback({ message, type });
@@ -463,7 +868,7 @@ export default function ModuleScreen() {
                   const userDocRef = doc(db, 'leaderboard', firebaseUid);
                   const localBackup = await scoreService.getAllLocalData();
                   const updateData: any = {
-                    score: increment(1), // Authoritative cloud increment
+                    score: increment(1),
                     localBackup,
                     lastUpdate: new Date().toISOString(),
                     groupId: groupId
@@ -473,7 +878,6 @@ export default function ModuleScreen() {
                 } catch (e) {
                   console.error("Firebase updateDoc failed (may not exist). Trying setDoc fallback:", e);
                   try {
-                      // If the document doesn't exist yet, increment fails. Fallback to setDoc with score: 1
                       const userDocRef = doc(db, 'leaderboard', firebaseUid);
                       const localBackup = await scoreService.getAllLocalData();
                       const deviceId = await scoreService.getDeviceId();
@@ -529,144 +933,9 @@ export default function ModuleScreen() {
     }
   };
 
-  const moduleInfo = MODULES.find(m => m.id === id);
 
-  // 2. ACTIVE TYPE DEFINITION (Fixes activeType error - ensures mistakes bank and mock exam items render correctly)
-  const currentItem = questions[currentIndex] || {};
-  const activeType = (id === 'essay') ? 'essay' : (currentItem.type || currentItem.moduleType || id);
-  
-  // --- IDENTIFY MODULES (Must use activeType, NOT id) ---
-  const isReadAloud = activeType === 'read-aloud';
-  const isRepeatSentence = activeType === 'repeat-sentence';
-  const isDescribeImage = activeType === 'describe-image';
-  const isReOrder = activeType === 're-order-paragraphs';
-  const isFillBlanks = activeType === 'fill-blanks'; 
-  const isSummarizeSpoken = activeType === 'summarize-spoken';
-  const isWriteDictation = activeType === 'write-dictation';
-  const isHighlightIncorrect = activeType === 'highlight-incorrect';
-  const isMultipleChoice = activeType === 'multiple-choice';
-  const isSelectMissingWord = activeType === 'select-missing-word';
-  const isHighlightCorrectSummary = activeType === 'highlight-correct-summary'; 
-  const isEssay = activeType === 'essay'; 
-  const isSummarizeGroup = activeType === 'summarize-group-discussion'; 
-  const isRespondSituation = activeType === 'respond-to-situation'; 
-  
-  // Grouping Logic
-  const isMCSingle = activeType === 'multiple-choice-r-single' || activeType === 'multiple-choice-l-single' || activeType === 'highlight-correct-summary' || activeType === 'select-missing-word';
-  const isMCListeningMulti = activeType === 'multiple-choice-l-multi'; 
-  const isAnyMC = isMultipleChoice || isMCSingle || isMCListeningMulti;
-  const isSummarizeWritten = activeType === 'summarize-written';
-  const isRetellLecture = activeType === 'retell-lecture';
-  const isASQ = activeType === 'answer-short-question';
-  const isFillBlanksRW = activeType === 'fill-blanks-rw'; 
-  const isFillBlanksListening = activeType === 'fill-blanks-listening'; 
-  const isPersonalIntro = activeType === 'personal-intro';
-
-  // --- DATA LOADING ---
-  useEffect(() => {
-    let loaded: any[] =[]; 
-
-    if (id === 'mock-exam') {
-        try {
-            const configStr = typeof customConfig === 'string' ? customConfig : undefined;
-            const sections = generateMockExam(configStr); 
-            setMockExamSections(sections);
-            setMockExamFlow('MAIN_INTRO');
-            setQuestions([]); 
-        } catch (e) {
-            console.log("Mock Exam Error:", e);
-        }
-    } else if (id === 'mistakes') {
-        const loadMistakes = async () => {
-          const mistakes = await scoreService.getMistakes();
-          if (mistakes.length === 0) {
-            Alert.alert("Empty Bank", "You don't have any mistakes to review yet. Good job!");
-            router.back();
-            return;
-          }
-          setQuestions(mistakes);
-          setLoading(false);
-        };
-        loadMistakes();
-        return; // Skip standard loading
-    } else {
-        // Standard Module Loading
-        if (id === 'read-aloud') loaded = READ_ALOUD_QUESTIONS;
-        else if (id === 'repeat-sentence') loaded = REPEAT_SENTENCE_QUESTIONS;
-        else if (id === 'describe-image') loaded = DESCRIBE_IMAGE_QUESTIONS;
-        else if (id === 're-order-paragraphs') loaded = REORDER_PARAGRAPHS_QUESTIONS;
-        else if (id === 'fill-blanks') loaded = FILL_BLANKS_QUESTIONS;
-        else if (id === 'summarize-spoken') loaded = SUMMARIZE_SPOKEN_QUESTIONS;
-        else if (id === 'write-dictation') loaded = WRITE_DICTATION_QUESTIONS;
-        else if (id === 'highlight-incorrect') loaded = HIGHLIGHT_INCORRECT_QUESTIONS;
-        
-        // --- UPDATED LINES ---
-        else if (id === 'multiple-choice') loaded = MULTIPLE_CHOICE_QUESTIONS;
-        else if (id === 'multiple-choice-r-single') loaded = MULTIPLE_CHOICE_READING_SINGLE_QUESTIONS;
-        // ---------------------
-        
-        else if (id === 'summarize-written') loaded = SUMMARIZE_WRITTEN_QUESTIONS;
-        else if (id === 'retell-lecture') loaded = RETELL_LECTURE_QUESTIONS;
-        else if (id === 'answer-short-question') loaded = ANSWER_SHORT_QUESTION_DATA;
-        else if (id === 'fill-blanks-rw') loaded = FILL_BLANKS_RW_QUESTIONS;
-        else if (id === 'highlight-correct-summary') loaded = HIGHLIGHT_CORRECT_SUMMARY_QUESTIONS;
-        else if (id === 'select-missing-word') loaded = SELECT_MISSING_WORD_QUESTIONS;
-        else if (id === 'essay') loaded = ESSAY_QUESTIONS;
-        else if (id === 'summarize-group-discussion') loaded = SUMMARIZE_GROUP_QUESTIONS;
-        else if (id === 'respond-to-situation') loaded = RESPOND_SITUATION_QUESTIONS;
-        else if (id === 'multiple-choice-l-single') loaded = MULTIPLE_CHOICE_SINGLE_QUESTIONS;
-        else if (id === 'multiple-choice-l-multi') loaded = MULTIPLE_CHOICE_LISTENING_MULTI_QUESTIONS;
-        else if (id === 'fill-blanks-listening') loaded = LISTENING_FILL_BLANKS_QUESTIONS;
-        else if (id === 'personal-intro') {
-            loaded = [{ id: 'pi1', type: 'personal-intro', prompt: 'Please introduce yourself. This is not scored but will be sent to institutions.' }];
-        }
-    }
-
-    if (startIndex === 'random' && loaded.length > 0) {
-        setCurrentIndex(Math.floor(Math.random() * loaded.length));
-    }
-    
-    setQuestions(loaded ||[]); 
-    setLoading(false);
-  }, [id, startIndex]);
 
   // --- GLOBAL STATE ---
-  const [mode, setMode] = useState<TimerMode>('IDLE');
-  const [timeLeft, setTimeLeft] = useState(0);
-  const [recording, setRecording] = useState<Audio.Recording | null>(null);
-  const [result, setResult] = useState<any>(null);
-  const [showModelAnswer, setShowModelAnswer] = useState(false);
-  const [sound, setSound] = useState<Audio.Sound | null>(null);
-  const [lastRecordingUri, setLastRecordingUri] = useState<string | null>(null); 
-
-  // --- MODULE SPECIFIC STATE ---
-  const [jumbledList, setJumbledList] = useState<string[]>([]);
-  const [userOrder, setUserOrder] = useState<string[]>([]);
-  const [reOrderScore, setReOrderScore] = useState<{score: number, max: number} | null>(null);
-  
-  const [blankAnswers, setBlankAnswers] = useState<string[]>([]);
-  const [activeBlankIndex, setActiveBlankIndex] = useState<number | null>(null); 
-  const [activeRwBlankIndex, setActiveRwBlankIndex] = useState<number | null>(null);
-  const [fillBlankScore, setFillBlankScore] = useState<{score: number, max: number} | null>(null);
-  
-  const [userSummary, setUserSummary] = useState("");
-  const [wordCount, setWordCount] = useState(0);
-  const [isSummarizePlaying, setIsSummarizePlaying] = useState(false);
-  const [dictationPlayed, setDictationPlayed] = useState(false);
-  const [dictationResult, setDictationResult] = useState<any>(null);
-  const [selectedIndices, setSelectedIndices] = useState<number[]>([]);
-  const [playbackSpeed, setPlaybackSpeed] = useState(1.0);
-  const [showSpeedWarning, setShowSpeedWarning] = useState(false);
-  const [highlightResult, setHighlightResult] = useState<any>(null);
-  const [selectedOptions, setSelectedOptions] = useState<string[]>([]);
-  const [mcResult, setMcResult] = useState<any>(null);
-  const [lecturePlayed, setLecturePlayed] = useState(false);
-  const [isKeyboardVisible, setKeyboardVisible] = useState(false);
-  const [showSpeakNow, setShowSpeakNow] = useState(false);
-  const [showIntroPopup, setShowIntroPopup] = useState(true);
-  const [resetKey, setResetKey] = useState(0);
-  const [hideInstruction, setHideInstruction] = useState(false);
-  const startTimeRef = useRef<number>(Date.now());
 
   const TASK_INSTRUCTIONS: Record<string, string> = {
     'read-aloud': 'Speak the text smoothly at a natural pace with clear pronunciation, correct stress, and steady rhythm while matching the punctuation and meaning of the passage.',
@@ -685,7 +954,7 @@ export default function ModuleScreen() {
     'fill-blanks-rw': 'Choose the word that best completes the sentence by matching the meaning, grammar, and logic of the whole passage.',
     'highlight-correct-summary': 'Choose the summary that best matches the main idea of the audio by checking which option fits the overall meaning most accurately.',
     'select-missing-word': 'Pick the word that best completes the sentence by matching the meaning and the grammar of the audio.',
-    'essay': 'Write a 200-300 word well‑organised essay on the given topic, give reasons and examples, and stay focused on one main position.',
+    'essay': 'Write a 200-300 word well organised essay on the given topic, give reasons and examples, and stay focused on one main position.',
     'summarize-group-discussion': 'Summarize the viewpoints in the discussion.',
     'respond-to-situation': 'Speak one or two clear sentences that directly answer the situation by giving a natural, appropriate response.',
     'multiple-choice-l-single': 'Choose the one answer that best matches the meaning of the passage by checking which option fits the ideas most accurately.',
@@ -694,7 +963,6 @@ export default function ModuleScreen() {
     'personal-intro': 'Speak for about 30 seconds to introduce yourself by giving simple information about who you are, what you do, and something about your interests or background.',
     'mock-exam': 'Complete the full PTE mock exam. This includes all sections and is timed.'
   };
-  const [asqResultPopup, setAsqResultPopup] = useState(false);
 
   const PlaybackSpeedToggle = () => (
     <View style={{flexDirection:'row', backgroundColor:'#E2E8F0', borderRadius:16, padding:2}}>
@@ -738,25 +1006,10 @@ export default function ModuleScreen() {
     </View>
   );
   
-  const [rwAnswers, setRwAnswers] = useState<string[]>([]);
-  const [rwResult, setRwResult] = useState<{score: number, max: number} | null>(null);
-  const [lFibAnswers, setLFibAnswers] = useState<string[]>([]);
-  const [lFibResult, setLFibResult] = useState<{score: number, max: number} | null>(null);
-  const [showLFibPopup, setShowLFibPopup] = useState(false);
 
-  const [isImageViewVisible, setIsImageViewVisible] = useState(false);
-  const [currentZoomImage, setCurrentZoomImage] = useState<any>(null);
-
-  const [voiceId, setVoiceId] = useState<string | null>(null);
-  const [isVoiceReady, setIsVoiceReady] = useState(false);
-  const [isGeneratingTTS, setIsGeneratingTTS] = useState(false);
-
-  const [scoredQuestions, setScoredQuestions] = useState<Record<number, number>>({});
-  const currentSessionScore = Object.values(scoredQuestions).reduce((sum, val) => sum + val, 0);
 
   useEffect(() => {
     if (id && id !== 'mock-exam' && moduleInfo && questions.length > 0) {
-      // If the user has scored/answered the current question, we set resumeIndex to next question (safely capped)
       const hasAnsweredCurrent = scoredQuestions[currentIndex] !== undefined || mode === 'RESULT';
       const resumeIndex = hasAnsweredCurrent 
         ? Math.min(currentIndex + 1, questions.length - 1) 
@@ -771,136 +1024,24 @@ export default function ModuleScreen() {
     }
   }, [id, currentIndex, scoredQuestions, mode, questions.length, moduleInfo]);
 
-  const flatListRef = useRef<FlatList>(null);
-  const timerRef = useRef<NodeJS.Timeout | null>(null);
-  const timeLeftRef = useRef<number>(0);
-  const totalTimeRef = useRef<number>(0);
-  const autoNextTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const isPlayingAudio = mode === 'PLAYING_AUDIO';
-  
 
   // --- INIT ---
-  useEffect(() => {
-    (async () => {
-      await Audio.requestPermissionsAsync();
-      await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
-    })();
 
-    const getVoices = async (retries = 3) => {
-      try {
-        const voices = await Speech.getAvailableVoicesAsync();
-        
-        // OS TTS engines (especially Android) can be "cold" and return an empty list 
-        // on the very first time they are called. We wait and retry to let the OS wake up.
-        if (voices.length === 0 && retries > 0) {
-            setTimeout(() => getVoices(retries - 1), 800);
-            return;
-        }
+  // --- RESET STATE ON QUESTION CHANGE ---
 
-        // 1. Target iOS explicit male voices first (Daniel, Arthur)
-        let bestVoice = voices.find(v => v.identifier.includes("Daniel") || v.identifier.includes("Arthur")); 
-        
-        // 2. Target Android explicit OFFLINE male voices (rjs-local, gbd-local).
-        if (!bestVoice) bestVoice = voices.find(v => v.identifier.includes('en-gb') && (v.identifier.includes('rjs-local') || v.identifier.includes('gbd-local')));
-        
-        // 3. Fallback: Any offline en-GB voice
-        if (!bestVoice) bestVoice = voices.find(v => v.identifier.includes('en-gb') && v.identifier.includes('local'));
-        
-        // 4. Ultimate fallback: Any British voice
-        if (!bestVoice) bestVoice = voices.find(v => v.language.includes('en-GB'));
-        
-        if (bestVoice) setVoiceId(bestVoice.identifier);
-      } catch (e) {
-        console.log("Error loading voices");
-      }
-      setIsVoiceReady(true);
-    };
-    getVoices();
-
-    const keyboardShow = Keyboard.addListener(Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow', () => setKeyboardVisible(true));
-    const keyboardHide = Keyboard.addListener(Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide', () => setKeyboardVisible(false));
-
-    return () => { 
-      stopTimer(); 
-      Speech.stop(); 
-      if (autoNextTimerRef.current) clearTimeout(autoNextTimerRef.current);
-      keyboardShow.remove();
-      keyboardHide.remove();
-
-      // Record study time on exit
-      const endTime = Date.now();
-      const elapsedMs = endTime - startTimeRef.current;
-      const elapsedMins = Math.floor(elapsedMs / (1000 * 60));
-      if (elapsedMins > 0) {
-        // Cap at 2 hours for a single session to prevent bugs
-        scoreService.addStudyTime(Math.min(elapsedMins, 120));
-      }
-    };
-  }, []);
-
-  // --- RESET STATE ---
-  // --- STATE RESET ON QUESTION CHANGE ---
-  useEffect(() => {
-    if (showIntroPopup) return;
-
-    // Stop any audio/speech when moving between questions
-    stopTimer();
-    Speech.stop();
-    if(sound) { sound.unloadAsync(); setSound(null); }
-
-    if (questions.length > 0 && currentItem) {
-      // 1. RESET ALL GLOBAL STATES FIRST (Safer for Mock Exam)
-      setMode('IDLE'); setResult(null); setTimeLeft(0); setUserSummary(""); setWordCount(0);
-      setHideInstruction(false);
-      setSelectedOptions([]); setSelectedIndices([]); setRwAnswers([]); setLFibAnswers([]);
-      setBlankAnswers([]); setUserOrder([]); setJumbledList([]); 
-      setReOrderScore(null); setFillBlankScore(null);
-      setDictationResult(null); setHighlightResult(null); setMcResult(null); setRwResult(null);
-      setLFibResult(null); setLecturePlayed(false); setDictationPlayed(false); setIsSummarizePlaying(false);
-      setIsImageViewVisible(false); setCurrentZoomImage(null);
-      setAsqResultPopup(false);
-      setShowSpeakNow(false);
-      
-      // 2. SPECIFIC MODULE INITIALIZATION
-      if (isReOrder && currentItem.sentences) {
-        setJumbledList([...currentItem.sentences].sort(() => Math.random() - 0.5));
-      } 
-      if (isFillBlanks && currentItem.correctAnswers) {
-        setBlankAnswers(new Array(currentItem.correctAnswers.length).fill(null));
-      } 
-      if (isFillBlanksRW && currentItem.correctAnswers) {
-        setRwAnswers(new Array(currentItem.correctAnswers.length).fill(""));
-      } 
-      if (isFillBlanksListening && currentItem.correctAnswers) {
-        setLFibAnswers(new Array(currentItem.correctAnswers.length).fill(""));
-      } 
-      if (isEssay) {
-         setTimeout(() => startTimer(1200, () => handleEssaySubmit()), 500); 
-      } 
-      if (isPersonalIntro) {
-         setMode('IDLE'); // <--- Keeps it waiting for you to press 'Start'
-      }
-    }
-  }, [currentIndex, questions.length, showIntroPopup, resetKey]);
   const handleDismissIntro = () => {
     setShowIntroPopup(false);
   };
 
-  // --- SPECIAL FLOW FOR GROUP SUMMARY & SITUATION ---
-  // --- 5. AUTO PLAY AUDIO (With Safety Guards) ---
-  // --- NEW: START FLOWS FOR GROUP / SITUATION ---
   const startTealFlow = (recordTime: number) => {
       const currentQ = questions[currentIndex] || {};
       const txt = currentQ.transcript || currentQ.text || currentQ.situation || "Listen carefully.";
       
-      // 1. Give 10 seconds prep BEFORE audio
       setMode('PREP_LISTENING');
       startTimer(10, () => {
-          // 2. Play Audio
           setMode('PLAYING_AUDIO');
           
           const onAudioFinish = () => {
-              // 3. Give 10 seconds prep AFTER audio, then Record
               setMode('PREP');
               startTimer(10, () => startRecording(recordTime));
           };
@@ -913,7 +1054,6 @@ export default function ModuleScreen() {
       });
   };
 
-  // --- SPEECH HELPER ---
   const playAudioFromUrl = async (url: string, onComplete?: () => void, preserveMode: boolean = false) => {
     try {
       await Speech.stop();
@@ -923,17 +1063,12 @@ export default function ModuleScreen() {
           setMode('PLAYING_AUDIO');
       }
 
-      // 1. Load sound but DO NOT play yet (shouldPlay: false)
       const { sound: newSound } = await Audio.Sound.createAsync(
         { uri: url },
         { shouldPlay: false } 
       );
       
-      // 2. Set the speed (playbackSpeed comes from your state)
-      // The 'true' argument corrects pitch so it doesn't sound like a deep robot
       await newSound.setRateAsync(playbackSpeed, true); 
-
-      // 3. Now Play
       await newSound.playAsync();
       
       setSound(newSound);
@@ -956,24 +1091,10 @@ export default function ModuleScreen() {
     }
   };
 
-  useEffect(() => {
-    return () => {
-      if (sound) sound.unloadAsync();
-    };
-  }, [sound]);
-
-  // Clean up any active recording on unmount or before starting a new one
-  useEffect(() => {
-    return () => {
-      if (recording) {
-        recording.stopAndUnloadAsync().catch((e) => console.log("Silent unload catch:", e));
-      }
-    };
-  }, [recording]);
 
   const speakText = (text: string, onDone?: () => void, rate: number = 0.9) => {
-    if (!isVoiceReady) return; // Prevent fallback to generic voice while OS voice list loads
-    Speech.stop(); // Force reset the TTS engine state
+    if (!isVoiceReady) return;
+    Speech.stop();
     const options: Speech.SpeechOptions = { 
       pitch: 1.0, 
       rate: rate, 
@@ -988,19 +1109,15 @@ export default function ModuleScreen() {
     if (voiceId) {
       options.voice = voiceId;
     } else {
-      // Only set language if we completely failed to find a British voice earlier
       options.language = 'en-GB';
     }
     Speech.speak(text, options);
   };
 
   const playHeatmapWord = (text: string) => {
-      // Clean the word and allow hyphens/apostrophes (e.g., "don't").
       if (!text || typeof text !== 'string') return;
       const cleanWord = text.replace(/[^a-zA-Z'-]/g, '').trim();
       if (!cleanWord) return;
-      
-      // Providing the word explicitly without extra grammar or casing that might trigger NLP errors
       speakText(cleanWord, undefined, 0.9);
   };
 
@@ -1047,7 +1164,6 @@ export default function ModuleScreen() {
 
   const scrollToQuestion = (index: number) => {
     if (id === 'mock-exam' && index < currentIndex) {
-      // Generally don't allow going back in mock exam as it's one-way
       return; 
     }
     setCurrentIndex(index);
@@ -1083,7 +1199,6 @@ export default function ModuleScreen() {
 
   const handleNext = () => {
     if (id === 'mock-exam') {
-      // Record score before moving
       const currentQScore = scoredQuestions[currentIndex] || 0;
       const sectionId = mockExamSections[currentSectionIndex].id;
       setSectionScores(prev => ({
@@ -1094,16 +1209,14 @@ export default function ModuleScreen() {
       if (currentIndex < questions.length - 1) {
         scrollToQuestion(currentIndex + 1);
       } else {
-        // End of section
         if (currentSectionIndex < mockExamSections.length - 1) {
           const nextIdx = currentSectionIndex + 1;
           setCurrentSectionIndex(nextIdx);
           setQuestions(mockExamSections[nextIdx].questions);
           setCurrentIndex(0);
-          setScoredQuestions({}); // Reset for new section
+          setScoredQuestions({});
           setMockExamFlow('SECTION_INTRO');
         } else {
-          // End of exam
           setMockExamFlow('FINAL_RESULTS');
         }
       }
@@ -1123,21 +1236,16 @@ export default function ModuleScreen() {
   const startASQSequence = () => {
     const currentQ = questions[currentIndex];
     
-
-    // Define what happens after audio finishes (Common for both MP3 and Robot)
     const onAudioFinish = () => {
       setMode('WAITING_NEXT'); 
-      // Wait 1 second before recording starts
       setTimeout(() => { startRecording(3); }, 1000);
     };
 
-    // 1. Check for Cloud Audio (MP3)
     if (currentQ.audioUrl) {
        playAudioFromUrl(currentQ.audioUrl, onAudioFinish);
        return;
     }
 
-    // 2. Fallback to Robot Voice
     setMode('PLAYING_AUDIO');
     speakText(currentQ.text, onAudioFinish, playbackSpeed);
   };
@@ -1164,7 +1272,6 @@ export default function ModuleScreen() {
           if (currentQ.audioUrl) {
               playAudioFromUrl(currentQ.audioUrl, onFinish);
           } else {
-              // SAFE FALLBACK: Checks transcript first, then text
               const rawText = currentQ.transcript || currentQ.text || "";
               const cleanTranscript = rawText.replace("Audio will begin in 10 seconds...", "").trim();
               speakText(cleanTranscript, onFinish, playbackSpeed);
@@ -1173,7 +1280,6 @@ export default function ModuleScreen() {
     }, 1.0);
   };
 
-  // --- ADDED THIS NEW FUNCTION HERE ---
   const handleStopAudio = async () => {
     Speech.stop();
     if (sound) {
@@ -1185,17 +1291,14 @@ export default function ModuleScreen() {
     }
     setMode('IDLE');
   };
-  // ------------------------------------
 
   const handlePlayLFibAudio = () => {
     const currentQ = questions[currentIndex];
     const onFinish = () => setMode('IDLE');
 
-    // 1. Check if we have a Google Cloud MP3
     if (currentQ.audioUrl) {
         playAudioFromUrl(currentQ.audioUrl, onFinish);
     } else {
-        // 2. Fallback to Robotic TTS if no MP3 is found
         setMode('PLAYING_AUDIO');
         speakText(currentQ.text, onFinish, playbackSpeed);
     }
@@ -1206,7 +1309,6 @@ export default function ModuleScreen() {
     
     try {
       await Speech.stop();
-      // Small delay to allow Speech callbacks to settle
       await new Promise(resolve => setTimeout(resolve, 100));
       
       if (sound) {
@@ -1224,7 +1326,6 @@ export default function ModuleScreen() {
         return; 
       }
       
-      // Ensure any existing recording is stopped and unloaded
       if (recording) {
         try {
           await recording.stopAndUnloadAsync();
@@ -1232,11 +1333,8 @@ export default function ModuleScreen() {
         setRecording(null);
       }
 
-      // Show "Speak Now" popup BEFORE starting the recording
       setShowSpeakNow(true);
       
-      // Wait for the popup to disappear before starting the actual recording and timer
-      // This ensures the user can see the text/image before the clock starts ticking
       await new Promise(resolve => setTimeout(resolve, 2000));
       setShowSpeakNow(false);
 
@@ -1310,7 +1408,6 @@ export default function ModuleScreen() {
           if (isRespondSituation) ctx = `Situation: ${q.situation}. Task: ${q.task}`;
           if (isSummarizeGroup) ctx = `Topic: ${q.topic}. Transcript: ${q.transcript}`;
 
-          // --- NEW: BYPASS SCORING FOR PERSONAL INTRO ---
           if (isPersonalIntro) {
               setResult({ 
                   overall: 0, 
@@ -1319,23 +1416,19 @@ export default function ModuleScreen() {
               setMode('RESULT');
               return;
           }
-          // ----------------------------------------------
 
           const res = await analyzeSpeech(uri, ctx, moduleInfo?.title || "", isDescribeImage ? q.image : undefined); 
 
           if (!res) throw new Error("AI Analysis returned no result");
 
-          // Update adaptive performance metrics
           await scoreService.updatePerformance({
             fluency: res.fluency,
             pronunciation: res.pronunciation,
             listening_recall: res.content
           });
 
-          // --- ADDED: INITIALIZE BEST SCORE TRACKER ---
           const initialScore = isASQ ? res.content : res.overall;
           setBestScores(prev => ({ ...prev, [currentIndex]: initialScore }));
-          // --------------------------------------------
 
           if (res.userTranscript) setUserSummary(res.userTranscript);
           
@@ -1395,7 +1488,6 @@ export default function ModuleScreen() {
     
     if (!res) throw new Error("AI returned empty result");
 
-    // Update adaptive performance metrics
     await scoreService.updatePerformance({
       fluency: res.fluency,
       pronunciation: res.pronunciation,
@@ -1404,26 +1496,21 @@ export default function ModuleScreen() {
 
     if (res.userTranscript) setUserSummary(res.userTranscript);
     
-    // 1. Calculate the points for this specific attempt
     let newPts = res.overall;
     if (isASQ) newPts = res.content;
 
-    // 2. Get the previous best score for this question (default to 0)
     const previousBest = bestScores[currentIndex] || 0;
 
-    // 3. Compare and show "Success" if the user improved
     if (newPts > previousBest && previousBest > 0) {
       Alert.alert("Success!", `You improved your score from ${previousBest.toFixed(0)} to ${newPts.toFixed(0)}!`);
       console.log("Retry finished: Sorry! No improvement.");
     }
 
-    // 4. Update the Best Scores tracker
     setBestScores(prev => ({
       ...prev, 
       [currentIndex]: Math.max(previousBest, newPts)
     }));
 
-    // 5. Standard result handling
     let ptsForSession = res.overall >= 50 ? 1 : 0;
     if (isASQ) {
       ptsForSession = res.content >= 50 ? 1 : 0;
@@ -1492,7 +1579,6 @@ export default function ModuleScreen() {
       const q = questions[currentIndex];
       const res = await analyzeWriting(userSummary, isSummarizeWritten ? q.text : q.transcript, isSummarizeWritten ? "Summarize Written" : "Summarize Spoken");
       
-      // Update adaptive performance metrics
       if (res.breakdown) {
         await scoreService.updatePerformance({
           grammar: res.breakdown.grammar,
@@ -1519,7 +1605,6 @@ export default function ModuleScreen() {
       const q = questions[currentIndex];
       const res = await analyzeWriting(userSummary, q.topic, "Essay");
       
-      // Update adaptive performance metrics
       if (res.breakdown) {
         await scoreService.updatePerformance({
           grammar: res.breakdown.grammar,
@@ -1582,7 +1667,6 @@ export default function ModuleScreen() {
   
   const toggleSpeed = () => { if (playbackSpeed === 1.0) { setPlaybackSpeed(0.75); setShowSpeedWarning(true); } else { setPlaybackSpeed(1.0); } };
   const handlePlayHighlight = () => {
-    // 1. If currently playing, STOP it
     if (mode === 'PLAYING_AUDIO') {
         Speech.stop();
         if (sound) {
@@ -1594,16 +1678,12 @@ export default function ModuleScreen() {
         return;
     }
 
-    // 2. Play Audio
     const currentQ = questions[currentIndex];
     const onFinish = () => setMode('IDLE');
 
-    // Use Cloud URL if available (MP3)
     if (currentQ.audioUrl) {
         playAudioFromUrl(currentQ.audioUrl, onFinish);
     } else {
-        // Fallback to Robot Voice
-        // Note: It reads 'spokenText' (the correct text), not 'displayText' (the one with errors)
         speakText(currentQ.spokenText || currentQ.text, onFinish, playbackSpeed);
     }
   };
@@ -1630,18 +1710,16 @@ export default function ModuleScreen() {
     setMode('RESULT'); 
   };
   const handlePlayDictation = () => {
-    if (dictationPlayed) return; // Prevent playing multiple times if that's your rule
+    if (dictationPlayed) return;
 
     const onFinish = () => {
       setMode('IDLE');
       setDictationPlayed(true);
     };
 
-    // 1. Check for Cloud Audio (MP3)
     if (currentItem.audioUrl) {
       playAudioFromUrl(currentItem.audioUrl, onFinish);
     } else {
-      // 2. Fallback to Robotic TTS
       setMode('PLAYING_AUDIO');
       speakText(currentItem.text, onFinish, playbackSpeed);
     }
@@ -1704,7 +1782,6 @@ export default function ModuleScreen() {
   const returnToJumbled = (t: string) => { if(reOrderScore) return; setUserOrder(p => p.filter(x => x!==t)); setJumbledList(p => [...p, t]); };
   const checkReOrderAnswer = () => {
   const co = questions[currentIndex].sentences;
-  // Use userOrder or whatever your "Answer Box" state is called
   const currentUserOrder = userOrder || []; 
 
   console.log("Checking Answer...");
@@ -1719,7 +1796,6 @@ export default function ModuleScreen() {
   const max = co.length - 1;
 
   for (let i = 0; i < currentUserOrder.length - 1; i++) {
-    // Checking adjacent pairs
     if (co.indexOf(currentUserOrder[i + 1]) === co.indexOf(currentUserOrder[i]) + 1) {
       s++;
     }
@@ -1739,7 +1815,6 @@ export default function ModuleScreen() {
     }
     const correct = questions[currentIndex].correctAnswers; let score = 0; rwAnswers.forEach((ans, index) => { if (ans.trim().toLowerCase() === correct[index].toLowerCase()) score++; }); const points = score / correct.length; setScoredQuestions(prev => ({...prev, [currentIndex]: points})); awardPointIfFirstAttempt(score === correct.length); setRwResult({ score, max: correct.length }); setMode('RESULT'); 
   };
-  const handleLFibChange = React.useCallback((text: string, index: number) => { setLFibAnswers(prev => { const newAnswers = [...prev]; newAnswers[index] = text; return newAnswers; }); }, []);
   const checkLFibAnswer = () => { 
     if (lFibAnswers.some(ans => !ans || ans.trim() === "")) {
       Alert.alert("Wait!", "Please complete the exercise before submitting your answers.");
@@ -1758,21 +1833,11 @@ export default function ModuleScreen() {
 
   const isScrollEnabled = mode === 'IDLE' || mode === 'RESULT' || isReOrder || isFillBlanks || isSummarizeSpoken || isWriteDictation || isHighlightIncorrect || isAnyMC || isSummarizeWritten || isRetellLecture || isFillBlanksRW || isFillBlanksListening || isASQ || isEssay || isSummarizeGroup || isRespondSituation;
   const isAiProcessing = mode === 'PROCESSING';
-  const isAnyIncorrect = !!(
-    (reOrderScore && reOrderScore.score < reOrderScore.max) ||
-    (fillBlankScore && fillBlankScore.score < fillBlankScore.max) ||
-    (rwResult && rwResult.score < rwResult.max) ||
-    (lFibResult && lFibResult.score < lFibResult.max) ||
-    (mcResult && mcResult.score < mcResult.max) ||
-    (dictationResult && dictationResult.score < dictationResult.max) ||
-    (highlightResult && highlightResult.score < highlightResult.max) ||
-    (result && (isASQ ? result.content < 50 : result.overall < 50))
-  );
+  const isAnyIncorrect = !!(reOrderScore && reOrderScore.score < reOrderScore.max) || !!(fillBlankScore && fillBlankScore.score < fillBlankScore.max) || !!(rwResult && rwResult.score < rwResult.max) || !!(lFibResult && lFibResult.score < lFibResult.max) || !!(mcResult && mcResult.score < mcResult.max) || !!(dictationResult && dictationResult.score < dictationResult.max) || !!(highlightResult && highlightResult.score < highlightResult.max) || (result && (isASQ ? result.content < 50 : result.overall < 50));
 
   const renderItem = ({ item, index }: { item: any, index: number }) => (
     <View style={[styles.fullScreenPage, { flex: 1 }]}>
       <View style={[styles.card, { flex: 1 }]}>
-        {/* --- UPDATED QUESTION INDEX --- */}
         <View style={{flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10}}>
           <Text style={[styles.questionIndex, {marginBottom: 0}]}>
               {id === 'mock-exam' ? `Task ${index + 1} of ${questions.length}` : (id === 'mistakes' ? `Review ${index + 1} of ${questions.length}` : `Question ${index + 1} of ${questions.length}`)}
@@ -1813,7 +1878,7 @@ export default function ModuleScreen() {
           </View>
         )}
         
-        {/* 0. PERSONAL INTRO (Updated with Big Timer) */}
+        {/* 0. PERSONAL INTRO */}
         {(isPersonalIntro && mode !== 'RESULT') && (
              <View style={{flex: 1, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 20}}>
                <MaterialCommunityIcons 
@@ -1859,10 +1924,9 @@ export default function ModuleScreen() {
             </ScrollView> 
           </View>
         )}
-        {/* 3. REPEAT SENTENCE (Hidden Text) */}
+        {/* 3. REPEAT SENTENCE */}
           {isRepeatSentence && (
             <View style={[styles.audioPlaceholder, mode !== 'RESULT' && { flex: 1 }]}>
-               {/* ONLY show text if we have a result. Otherwise, show a listening icon. */}
                {mode === 'RESULT' ? (
                   <View style={{alignItems: 'center', justifyContent: 'center', height: 40, flexDirection: 'row', gap: 8}}>
                       <MaterialCommunityIcons name="check-decagram" size={20} color="#10B981" />
@@ -1876,7 +1940,6 @@ export default function ModuleScreen() {
                   </View>
                )}
 
-               {/* Audio Controls (Only show when NOT in Result mode) */}
                {mode !== 'RESULT' && AudioControlBar({ onPlay: mode === 'PLAYING_AUDIO' ? handleStopAudio : handlePlayAudio, isPlaying: mode === 'PLAYING_AUDIO' })}
             </View>
           )}
@@ -1905,7 +1968,6 @@ export default function ModuleScreen() {
           <View style={{flex: 1}}>
             <Text style={styles.reOrderTitle}>{item.title}</Text>
             
-            {/* --- SHOW DRAG & DROP INTERFACE --- */}
             <View style={{flex: 1, gap: 10, marginTop: 10}}>
               <View style={styles.targetArea}>
                 {userOrder.length === 0 && <Text style={styles.placeholderText}>Tap items below to move them here</Text>}
@@ -2034,16 +2096,12 @@ export default function ModuleScreen() {
             )}
           </View>
         )}
- {/* 12. HIGHLIGHT INCORRECT WORDS (Fixed Audio Controls) */}
         {isHighlightIncorrect && ( 
           <View style={{ flex: 1 }}>
             <ScrollView style={{ flex: 1 }} contentContainerStyle={{paddingBottom: 50}}>
-              {/* Audio Control Bar */}
               {AudioControlBar({ onPlay: handlePlayHighlight, isPlaying: mode === 'PLAYING_AUDIO' })}
 
-              {/* Text Area */}
               <View style={styles.highlightContainer}>
-                 {/* Note: Added check for item.displayText to prevent crashes if data is missing */}
                  {item.displayText?.split(/\s+/).map((w:string, i:number) => {
                     const isSelected = selectedIndices.includes(i); 
                     let bgColor = 'transparent'; 
@@ -2051,10 +2109,10 @@ export default function ModuleScreen() {
                     
                     if (highlightResult && highlightResult.score === highlightResult.max) { 
                        if (highlightResult.correctIndices.includes(i)) {
-                           bgColor = '#10B981'; // Green (It was an error)
+                           bgColor = '#10B981';
                            textColor = '#fff';
                        } else if (isSelected) {
-                           bgColor = '#EF4444'; // Red (Selected but not an error)
+                           bgColor = '#EF4444';
                            textColor = '#fff';
                        }
                     } else if (isSelected) { 
@@ -2074,7 +2132,6 @@ export default function ModuleScreen() {
                   })}
               </View>
               
-              {/* Submit Button */}
               {mode === 'IDLE' && !highlightResult && (
                   <TouchableOpacity style={[styles.btnPrimary, {marginTop: 20}]} onPress={submitHighlight}>
                       <Text style={styles.btnText}>Submit</Text>
@@ -2083,52 +2140,42 @@ export default function ModuleScreen() {
             </ScrollView> 
           </View>
         )}
-        {/* 13. MC RENDERERS (Multiple Choice, Highlight Summary, Missing Word) */}
- {/* 13. MC RENDERERS (Reading & Listening) */}
-          {isAnyMC && (
-             <ScrollView 
-                nestedScrollEnabled 
-                style={{ flex: 1 }}
-                contentContainerStyle={{ paddingBottom: 100 }} 
-             >
-                
-                {/* 1. SHOW AUDIO PLAYER FOR LISTENING TASKS ONLY */}
-                {(activeType === 'multiple-choice-l-multi' || activeType === 'multiple-choice-l-single' || isHighlightCorrectSummary || isSelectMissingWord) && (
-                    <View style={{marginBottom: 20}}>
-                      {AudioControlBar({ 
-                        onPlay: mode === 'PLAYING_AUDIO' ? handleStopAudio : startListeningMC, 
-                        isPlaying: mode === 'PLAYING_AUDIO', 
-                        label: mode === 'PREP_LISTENING' ? `Prepare: ${timeLeft}s` : "Play Audio"
-                      })}
-                    </View>
-                )}
+        {isAnyMC && (
+           <ScrollView 
+              nestedScrollEnabled 
+              style={{ flex: 1 }}
+              contentContainerStyle={{ paddingBottom: 100 }} 
+           >
+              {(activeType === 'multiple-choice-l-multi' || activeType === 'multiple-choice-l-single' || isHighlightCorrectSummary || isSelectMissingWord) && (
+                  <View style={{marginBottom: 20}}>
+                    {AudioControlBar({ 
+                      onPlay: mode === 'PLAYING_AUDIO' ? handleStopAudio : startListeningMC, 
+                      isPlaying: mode === 'PLAYING_AUDIO', 
+                      label: mode === 'PREP_LISTENING' ? `Prepare: ${timeLeft}s` : "Play Audio"
+                    })}
+                  </View>
+              )}
 
-                {/* 2. SHOW TEXT PASSAGE FOR READING TASKS ONLY */}
-                {!(activeType === 'multiple-choice-l-multi' || activeType === 'multiple-choice-l-single' || isHighlightCorrectSummary || isSelectMissingWord) && (item.text || item.transcript) && (
-                    <Text style={styles.questionText}>{item.text || item.transcript}</Text>
-                )}
+              {!(activeType === 'multiple-choice-l-multi' || activeType === 'multiple-choice-l-single' || isHighlightCorrectSummary || isSelectMissingWord) && (item.text || item.transcript) && (
+                  <Text style={styles.questionText}>{item.text || item.transcript}</Text>
+              )}
 
-                {/* 3. SHOW THE QUESTION */}
-                {item.question && <Text style={{fontWeight:'bold', marginTop:10, fontSize: 16, color: colors.text}}>{item.question}</Text>}
-                
-                <View style={{ marginTop: 20, gap: 10 }}>
-                  {item.options?.map((opt: any) => {
-                    const isSelected = selectedOptions.includes(opt.id);
-                    let bgColor = isSelected ? '#EFF6FF' : '#F8FAFC';
-                    let borderColor = isSelected ? '#2563EB' : '#E2E8F0';
-                    let iconColor = isSelected ? '#2563EB' : '#CBD5E1';
-                    let iconName = isMCSingle ? "circle-outline" : "checkbox-blank-outline";
+              {item.question && <Text style={{fontWeight:'bold', marginTop:10, fontSize: 16, color: colors.text}}>{item.question}</Text>}
+              
+              <View style={{ marginTop: 20, gap: 10 }}>
+                {item.options?.map((opt: any) => {
+                  const isSelected = selectedOptions.includes(opt.id);
+                  let bgColor = isSelected ? '#EFF6FF' : '#F8FAFC';
+                  let borderColor = isSelected ? '#2563EB' : '#E2E8F0';
+                  let iconColor = isSelected ? '#2563EB' : '#CBD5E1';
+                  let iconName = isMCSingle ? "circle-outline" : "checkbox-blank-outline";
 
-                    if (isSelected) {
-                        iconName = isMCSingle ? "radiobox-marked" : "checkbox-marked";
-                    }
+                  if (isSelected) {
+                      iconName = isMCSingle ? "radiobox-marked" : "checkbox-marked";
+                  }
 
                   if (mcResult) {
                          const correct = isMCSingle ? [currentItem.correctOption] : (currentItem.correctOptions ||[]);
-                         // Only show correct/incorrect colors if the user got it right
-                         // OR if we want to show them what they got wrong (but hide the actual correct one if they missed it?)
-                         // The user said "expect to see the whole text and the correct answer they selected"
-                         // If they got it right, show green. If they got it wrong, show red for their choice.
                          if (mcResult.score === mcResult.max && correct.includes(opt.id)) {
                              bgColor = '#D1FAE5'; borderColor = '#10B981'; iconColor = '#10B981'; iconName = isMCSingle ? "check-circle" : "checkbox-marked";
                          } else if (isSelected) {
@@ -2138,30 +2185,29 @@ export default function ModuleScreen() {
                                  bgColor = '#FEE2E2'; borderColor = '#EF4444'; iconColor = '#EF4444'; iconName = isMCSingle ? "close-circle" : "close-box";
                              }
                          }
-                    }
-                    
-                    return (
-                      <TouchableOpacity 
-                        key={opt.id} 
-                        style={[styles.mcOption, { backgroundColor: bgColor, borderColor: borderColor, borderWidth: 2 }]} 
-                        onPress={() => toggleOption(opt.id)}
-                        disabled={!!mcResult} 
-                      >
-                        <MaterialCommunityIcons name={iconName as any} size={24} color={iconColor} style={{marginRight: 10}} />
-                        <Text style={{flex: 1, fontSize: 16, color: '#1E293B', lineHeight: 24}}>{opt.text}</Text>
-                      </TouchableOpacity>
-                    );
-                  })}
-                </View>
-
-                {/* Show button IMMEDIATELY when an option is selected */}
-                {!mcResult && selectedOptions.length > 0 && (
-                    <TouchableOpacity style={[styles.btnPrimary, {marginTop:25}]} onPress={submitMultipleChoice}>
-                        <Text style={styles.btnText}>Submit Answer</Text>
+                  }
+                  
+                  return (
+                    <TouchableOpacity 
+                      key={opt.id} 
+                      style={[styles.mcOption, { backgroundColor: bgColor, borderColor: borderColor, borderWidth: 2 }]} 
+                      onPress={() => toggleOption(opt.id)}
+                      disabled={!!mcResult} 
+                    >
+                      <MaterialCommunityIcons name={iconName as any} size={24} color={iconColor} style={{marginRight: 10}} />
+                      <Text style={{flex: 1, fontSize: 16, color: '#1E293B', lineHeight: 24}}>{opt.text}</Text>
                     </TouchableOpacity>
-                )}
-             </ScrollView>
-          )}
+                  );
+                })}
+              </View>
+
+              {!mcResult && selectedOptions.length > 0 && (
+                  <TouchableOpacity style={[styles.btnPrimary, {marginTop:25}]} onPress={submitMultipleChoice}>
+                      <Text style={styles.btnText}>Submit Answer</Text>
+                  </TouchableOpacity>
+              )}
+           </ScrollView>
+        )}
         {isRetellLecture && ( 
           <View style={{flex: 1, justifyContent:'center', alignItems:'center', width: '100%'}}>
             <View style={{marginBottom: 30, alignItems:'center', width: '100%'}}>
@@ -2243,105 +2289,99 @@ export default function ModuleScreen() {
              </ScrollView>
           </View>
         )}
-{/* 11. TEAL UI (Group / Situation) */}
-          {((isSummarizeGroup || isRespondSituation) && mode !== 'RESULT') && (
-             <ScrollView style={{flex: 1}} contentContainerStyle={{paddingBottom:50}}>
-               <View style={{flexDirection: 'row', justifyContent: 'flex-end', marginBottom: 10}}>
-                 {mode === 'IDLE' && PlaybackSpeedToggle()}
-               </View>
-               
-               {/* 1. TEXT DISPLAYS (Hidden until Start is pressed!) */}
-               {isRespondSituation && mode !== 'IDLE' && (
-                  <View style={{backgroundColor: isDark ? colors.border : '#F0FDFA', padding:15, borderRadius:8, marginBottom:15}}>
-                     <Text style={{color: isDark ? colors.primary : '#0F766E', fontWeight:'bold', marginBottom:5}}>Situation:</Text>
-                     <Text style={{fontSize:16, marginBottom:10, lineHeight:22, color: colors.text}}>{item.situation}</Text>
-                     <Text style={{color: isDark ? colors.primary : '#0F766E', fontWeight:'bold'}}>Task: <Text style={{fontWeight:'normal', color: colors.text}}>{item.task}</Text></Text>
-                  </View>
-               )}
-               {isSummarizeGroup && mode !== 'IDLE' && (
-                   <View style={{backgroundColor: isDark ? colors.border : '#F0F9FF', padding:15, borderRadius:8, marginBottom:15}}>
-                      <Text style={{color: isDark ? colors.primary : '#0369A1', fontWeight:'bold', marginBottom:5}}>Topic:</Text>
-                      <Text style={{fontSize:16, lineHeight:22, color: colors.text}}>{item.topic}</Text>
-                   </View>
-                )}
-
-               {/* 2. STATUS CARD */}
-               {index === currentIndex && (
-                 <View style={{borderLeftWidth:5, borderLeftColor:'#14B8A6', backgroundColor: isDark ? colors.border : '#fff', padding:20, elevation:2, marginTop: 10, borderRadius: 4}}>
-                    <Text style={{textAlign:'center', fontWeight:'bold', color:colors.subtext, textTransform:'uppercase', fontSize:12}}>Current Status</Text>
-                    <Text style={{textAlign:'center', fontSize:22, color:colors.text, fontWeight:'bold', marginVertical:10}}>
-                       {mode === 'IDLE' ? "Waiting to Start" :
-                        mode === 'PLAYING_AUDIO' ? "Listening..." : 
-                        mode === 'PREP' ? `Prepare to Speak: ${timeLeft}s` : 
-                        mode === 'RECORDING' ? "Recording..." : "Completed"}
-                    </Text>
-                    <View style={{height:6, backgroundColor: isDark ? '#334155' : '#E2E8F0', borderRadius:3, width:'100%', overflow:'hidden'}}>
-                        <View style={{height:'100%', width: `${totalTimeRef.current > 0 ? (timeLeft / totalTimeRef.current) * 100 : 0}%`, backgroundColor:'#14B8A6'}}/>
-                    </View>
+        {((isSummarizeGroup || isRespondSituation) && mode !== 'RESULT') && (
+           <ScrollView style={{flex: 1}} contentContainerStyle={{paddingBottom:50}}>
+             <View style={{flexDirection: 'row', justifyContent: 'flex-end', marginBottom: 10}}>
+               {mode === 'IDLE' && PlaybackSpeedToggle()}
+             </View>
+             
+             {isRespondSituation && mode !== 'IDLE' && (
+                <View style={{backgroundColor: isDark ? colors.border : '#F0FDFA', padding:15, borderRadius:8, marginBottom:15}}>
+                   <Text style={{color: isDark ? colors.primary : '#0F766E', fontWeight:'bold', marginBottom:5}}>Situation:</Text>
+                   <Text style={{fontSize:16, marginBottom:10, lineHeight:22, color: colors.text}}>{item.situation}</Text>
+                   <Text style={{color: isDark ? colors.primary : '#0F766E', fontWeight:'bold'}}>Task: <Text style={{fontWeight:'normal', color: colors.text}}>{item.task}</Text></Text>
+                </View>
+             )}
+             {isSummarizeGroup && mode !== 'IDLE' && (
+                 <View style={{backgroundColor: isDark ? colors.border : '#F0F9FF', padding:15, borderRadius:8, marginBottom:15}}>
+                    <Text style={{color: isDark ? colors.primary : '#0369A1', fontWeight:'bold', marginBottom:5}}>Topic:</Text>
+                    <Text style={{fontSize:16, lineHeight:22, color: colors.text}}>{item.topic}</Text>
                  </View>
-               )}
+              )}
 
-               {/* 3. BUTTON CONTROLS */}
-               {index === currentIndex && (
-                   <View style={{marginTop:20, flexDirection:'row', gap:10}}>
-                      
-                      {/* START BUTTON */}
-                      {mode === 'IDLE' && (
-                          <TouchableOpacity style={{flex:1, backgroundColor:'#2563EB', padding:15, borderRadius:8, alignItems:'center'}} onPress={() => {
-                              const recordTime = isSummarizeGroup ? 120 : 40;
-                              
-                              // Step 1: Immediately Play Audio
-                              setMode('PLAYING_AUDIO');
-                              
-                              const onFinish = () => {
-                                  // Step 2: Audio finished, start 10s Prep Timer
-                                  setMode('PREP');
-                                  startTimer(10, () => {
-                                      // Step 3: Prep finished, start Recording
-                                      startRecording(recordTime);
-                                  });
-                              };
+             {index === currentIndex && (
+               <View style={{borderLeftWidth:5, borderLeftColor:'#14B8A6', backgroundColor: isDark ? colors.border : '#fff', padding:20, elevation:2, marginTop: 10, borderRadius: 4}}>
+                  <Text style={{textAlign:'center', fontWeight:'bold', color:colors.subtext, textTransform:'uppercase', fontSize:12}}>Current Status</Text>
+                  <Text style={{textAlign:'center', fontSize:22, color:colors.text, fontWeight:'bold', marginVertical:10}}>
+                     {mode === 'IDLE' ? "Waiting to Start" :
+                      mode === 'PLAYING_AUDIO' ? "Listening..." : 
+                      mode === 'PREP' ? `Prepare to Speak: ${timeLeft}s` : 
+                      mode === 'RECORDING' ? "Recording..." : "Completed"}
+                  </Text>
+                  <View style={{height:6, backgroundColor: isDark ? '#334155' : '#E2E8F0', borderRadius:3, width:'100%', overflow:'hidden'}}>
+                      <View style={{height:'100%', width: `${totalTimeRef.current > 0 ? (timeLeft / totalTimeRef.current) * 100 : 0}%`, backgroundColor:'#14B8A6'}}/>
+                  </View>
+               </View>
+             )}
 
-                              if (item.audioUrl) {
-                                  playAudioFromUrl(item.audioUrl, onFinish);
-                              } else {
-                                  speakText(item.transcript || item.text || item.situation || "Listen carefully.", onFinish, playbackSpeed);
-                              }
-                          }}>
-                              <Text style={{color:'#fff', fontWeight:'bold', fontSize:16}}>Start Question</Text>
-                          </TouchableOpacity>
-                      )}
+             {index === currentIndex && (
+                 <View style={{marginTop:20, flexDirection:'row', gap:10}}>
+                    
+                    {mode === 'IDLE' && (
+                        <TouchableOpacity style={{flex:1, backgroundColor:'#2563EB', padding:15, borderRadius:8, alignItems:'center'}} onPress={() => {
+                            const recordTime = isSummarizeGroup ? 120 : 40;
+                            
+                            setMode('PLAYING_AUDIO');
+                            
+                            const onFinish = () => {
+                                setMode('PREP');
+                                startTimer(10, () => {
+                                    startRecording(recordTime);
+                                });
+                            };
 
-                      {/* SKIP PREP BUTTON (Only visible during the 10s prep phase) */}
-                      {mode === 'PREP' && (
-                          <TouchableOpacity style={{flex:1, backgroundColor:'#14B8A6', padding:15, borderRadius:8, alignItems:'center'}} onPress={() => {
-                              const recordTime = isSummarizeGroup ? 120 : 40;
-                              startRecording(recordTime);
-                          }}>
-                              <Text style={{color:'#fff', fontWeight:'bold', fontSize:16}}>Skip Prep</Text>
-                          </TouchableOpacity>
-                      )}
+                            if (item.audioUrl) {
+                                playAudioFromUrl(item.audioUrl, onFinish);
+                            } else {
+                                speakText(item.transcript || item.text || item.situation || "Listen carefully.", onFinish, playbackSpeed);
+                            }
+                        }}>
+                            <Text style={{color:'#fff', fontWeight:'bold', fontSize:16}}>Start Question</Text>
+                        </TouchableOpacity>
+                    )}
 
-                      {/* SUBMIT ANSWER BUTTON (Only visible while recording) */}
-                      {mode === 'RECORDING' && (
-                          <TouchableOpacity style={{flex:1, backgroundColor:'#EF4444', padding:15, borderRadius:8, alignItems:'center'}} onPress={() => stopRecording(recording)}>
-                              <Text style={{color:'#fff', fontWeight:'bold', fontSize:18}}>Submit Answer</Text>
-                          </TouchableOpacity>
-                      )}
-                   </View>
-               )}
-             </ScrollView>
-          )}
+                    {mode === 'PREP' && (
+                        <TouchableOpacity style={{flex:1, backgroundColor:'#14B8A6', padding:15, borderRadius:8, alignItems:'center'}} onPress={() => {
+                            const recordTime = isSummarizeGroup ? 120 : 40;
+                            startRecording(recordTime);
+                        }}>
+                            <Text style={{color:'#fff', fontWeight:'bold', fontSize:16}}>Skip Prep</Text>
+                        </TouchableOpacity>
+                    )}
+
+                    {mode === 'RECORDING' && (
+                        <TouchableOpacity style={{flex:1, backgroundColor:'#EF4444', padding:15, borderRadius:8, alignItems:'center'}} onPress={() => stopRecording(recording)}>
+                            <Text style={{color:'#fff', fontWeight:'bold', fontSize:18}}>Submit Answer</Text>
+                        </TouchableOpacity>
+                    )}
+                 </View>
+             )}
+           </ScrollView>
+        )}
       </View>
     </View>
   );
 
   const startMockExam = () => {
-    setMockExamFlow('SECTION_INTRO');
-    setCurrentSectionIndex(0);
-    setQuestions(mockExamSections[0].questions);
-    setCurrentIndex(0);
-  };
+      if (mockExamSections.length === 0) {
+        Alert.alert("Error", "Mock exam not ready. Please try again.");
+        return;
+      }
+      setMockExamFlow('SECTION_INTRO');
+      setCurrentSectionIndex(0);
+      setQuestions(mockExamSections[0].questions);
+      setCurrentIndex(0);
+    };
 
   const startSection = () => {
     setTimeLeft(5);
@@ -2454,7 +2494,6 @@ export default function ModuleScreen() {
       const qCount = section.questions.length;
       const percent = qCount > 0 ? Math.round((correct / qCount) * 100) : 0;
       
-      // Dynamic naming to be more specific (e.g. "Speaking" instead of "Speaking & Writing" if only one is present)
       let dynamicName = section.title;
       if (section.id === 'speaking-writing') {
         const hasSpeaking = section.questions.some((q: any) => ['read-aloud', 'repeat-sentence', 'describe-image', 'retell-lecture', 'answer-short-question', 'summarize-group-discussion', 'respond-to-situation'].includes(q.type));
@@ -2541,16 +2580,39 @@ export default function ModuleScreen() {
     );
   };
 
-  if (!moduleInfo && !CATEGORIES[id as string] && id !== 'mistakes') return <View><Text>Module not found</Text></View>;
 
-  if (id === 'mock-exam') {
-    if (mockExamFlow === 'MAIN_INTRO') return renderMainIntro();
-    if (mockExamFlow === 'SECTION_INTRO') return renderSectionIntro();
-    if (mockExamFlow === 'SECTION_POPUP') return renderSectionPopup();
-    if (mockExamFlow === 'FINAL_RESULTS') return renderFinalResults();
+  // ---- Early returns (all hooks have already run) ----
+  const isTaskLocked = (() => {
+    if (!settingsLoaded) return false;
+
+    // Custom Mock is permanently open. A custom mock is still routed
+    // through id='mock-exam', so identify it by the presence of customConfig.
+    if (id === 'custom-mock' || (id === 'mock-exam' && isCustomMockExam)) {
+      return false;
+    }
+
+    const taskId = id;
+    if (taskId && !CATEGORIES[taskId] && taskId !== 'mistakes') {
+      const firestoreKey = getFirestoreKey(taskId);
+      return activitySettings[firestoreKey] === false;
+    }
+
+    return false;
+  })();
+
+  if (isTaskLocked && !loading) {
+    return (
+      <SafeAreaView style={[styles.container, { justifyContent: 'center', alignItems: 'center' }]}> 
+        <View style={styles.lockOverlay}>
+          <MaterialCommunityIcons name="lock" size={80} color="#ef4444" />
+          <Text style={styles.lockOverlayText}>This task is currently locked by your teacher.</Text>
+        </View>
+      </SafeAreaView>
+    );
   }
 
   if (CATEGORIES[id as string]) {
+
     const category = CATEGORIES[id as string];
     return (
       <SafeAreaView style={styles.container}>
@@ -2563,49 +2625,112 @@ export default function ModuleScreen() {
         </View>
         <ScrollView contentContainerStyle={{ padding: 20 }}>
           <Text style={{ fontSize: 18, fontWeight: 'bold', color: colors.text, marginBottom: 20 }}>Select a Task Type:</Text>
-          {category.tasks.map((task) => (
-            <TouchableOpacity 
-              key={task.id} 
-              style={{ 
-                flexDirection: 'row', 
-                alignItems: 'center', 
-                backgroundColor: colors.surface, 
-                padding: 16, 
-                borderRadius: 16, 
-                marginBottom: 12,
-                shadowColor: '#000',
-                shadowOpacity: 0.05,
-                shadowRadius: 10,
-                elevation: 2
-              }}
-              onPress={() => router.push(`/module/${task.id}`)}
-            >
-              <View style={{ width: 44, height: 44, borderRadius: 12, backgroundColor: isDark ? colors.border : '#F1F5F9', justifyContent: 'center', alignItems: 'center', marginRight: 16 }}>
-                <MaterialCommunityIcons name={task.icon as any} size={24} color="#2563EB" />
-              </View>
-              <Text style={{ fontSize: 16, fontWeight: '600', color: colors.text }}>{task.title}</Text>
-              <MaterialCommunityIcons name="chevron-right" size={24} color="#94A3B8" style={{ marginLeft: 'auto' }} />
-            </TouchableOpacity>
-          ))}
+          {category.tasks.map((task) => {
+            const firestoreKey = getFirestoreKey(task.id);
+            const isLocked = activitySettings[firestoreKey] === false;
+            return (
+              <TouchableOpacity 
+                key={task.id} 
+                style={[
+                  { 
+                    flexDirection: 'row', 
+                    alignItems: 'center', 
+                    backgroundColor: colors.surface, 
+                    padding: 16, 
+                    borderRadius: 16, 
+                    marginBottom: 12,
+                    shadowColor: '#000',
+                    shadowOpacity: 0.05,
+                    shadowRadius: 10,
+                    elevation: 2
+                  },
+                  isLocked && styles.lockedTask
+                ]}
+                onPress={() => {
+                  if (!isLocked) {
+                    router.push(`/module/${task.id}`);
+                  } else {
+                    Alert.alert("Locked", "This task is currently locked by your teacher.");
+                  }
+                }}
+                disabled={isLocked}
+              >
+                <View style={{ width: 44, height: 44, borderRadius: 12, backgroundColor: isDark ? colors.border : '#F1F5F9', justifyContent: 'center', alignItems: 'center', marginRight: 16 }}>
+                  <MaterialCommunityIcons name={task.icon as any} size={24} color="#2563EB" />
+                </View>
+                <Text style={[ 
+                  { fontSize: 16, fontWeight: '600', color: colors.text, flex: 1 },
+                  isLocked && styles.lockedText
+                ]}>
+                  {task.title}
+                </Text>
+                {isLocked && <Text style={styles.lockIcon}>🔒</Text>}
+                {!isLocked && <MaterialCommunityIcons name="chevron-right" size={24} color="#94A3B8" style={{ marginLeft: 'auto' }} />}
+              </TouchableOpacity>
+            );
+          })}
         </ScrollView>
       </SafeAreaView>
     );
   }
 
+  if (id === 'mock-exam') {
+    if (mockExamFlow === 'MAIN_INTRO') return renderMainIntro();
+    if (mockExamFlow === 'SECTION_INTRO') return renderSectionIntro();
+    if (mockExamFlow === 'SECTION_POPUP') return renderSectionPopup();
+    if (mockExamFlow === 'FINAL_RESULTS') return renderFinalResults();
+  }
+
+  if (!moduleInfo && !CATEGORIES[id] && id !== 'mistakes') {
+    return <View><Text>Module not found</Text></View>;
+  }
+
+  // ----- REMAINING QUESTION PRACTICE -----
   if (questions.length === 0) return <View style={styles.centerContainer}><Text>Coming Soon</Text></View>;
+
+  // ----- handleStartPress: checks lock before starting any task -----
+  const handleStartPress = () => {
+    const taskId = id as string;
+    // Check if this is a specific task and is locked
+    if (taskId && !CATEGORIES[taskId] && taskId !== 'mock-exam' && taskId !== 'mistakes' && taskId !== 'custom-mock') {
+      const firestoreKey = getFirestoreKey(taskId);
+      if (activitySettings[firestoreKey] === false) {
+        Alert.alert("Locked", "This task is currently locked by your teacher.");
+        return;
+      }
+    }
+    // Proceed with original logic
+    if (isPersonalIntro) {
+      setMode('PREP'); startTimer(25, () => startRecording(30));
+    }
+    else if (isASQ) startASQSequence();
+    else if (isRetellLecture) handlePlayLecture();
+    else if (isRepeatSentence) handlePlayAudio();
+    else if (isReadAloud || isDescribeImage) handleStartPrep();
+    else if (isFillBlanks) checkFillBlankAnswer();
+    else if (isFillBlanksRW) checkRwAnswer();
+    else if (isFillBlanksListening) checkLFibAnswer();
+    else if (isReOrder) checkReOrderAnswer();
+    else if (isAnyMC) {
+      if (activeType === 'multiple-choice-l-multi' || activeType === 'multiple-choice-l-single' || isHighlightCorrectSummary || isSelectMissingWord) {
+        startListeningMC();
+      } else {
+        if (selectedOptions.length > 0) submitMultipleChoice();
+        else Alert.alert("Selection Required", "Please select at least one option.");
+      }
+    }
+    else handleNext();
+  };
 
   return (
     <SafeAreaView style={styles.container}>
-      {/* --- UPDATED HEADER START --- */}
       <View style={styles.header}>
-        {/* Left: Back Button */}
         <View style={styles.headerLeft}>
             <TouchableOpacity onPress={() => router.back()}>
                 <MaterialCommunityIcons name="arrow-left" size={28} color="#334155" />
             </TouchableOpacity>
         </View>
 
-        {/* Center: Title & Score */}
         <View style={styles.headerCenter}>
             {id !== 'mock-exam' && (
                 <View style={styles.scoreBadge}>
@@ -2619,12 +2744,9 @@ export default function ModuleScreen() {
             </Text>
         </View>
 
-        {/* Right: Empty View to balance the layout */}
         <View style={styles.headerRight} />
       </View>
 
-
-      {/* Audio controls moved out of the task flow */}
       {isFillBlanksListening && mode !== 'RESULT' && (
         <View style={{ paddingHorizontal: 15, paddingTop: 10 }}>
             {AudioControlBar({ onPlay: mode === 'PLAYING_AUDIO' ? handleStopAudio : handlePlayLFibAudio, isPlaying: mode === 'PLAYING_AUDIO' })}
@@ -2632,7 +2754,6 @@ export default function ModuleScreen() {
       )}
 
       <View style={[styles.carouselContainer, { flex: 1 }]}>
-        {/* Render only the CURRENT question. No FlatList, no memory bugs! */}
         {questions.length > 0 && renderItem({ item: questions[currentIndex], index: currentIndex })}
       </View>
 
@@ -2643,7 +2764,7 @@ export default function ModuleScreen() {
             {questions.map((_, index) => {
               const itemScored = scoredQuestions[index] !== undefined;
               const isCurrent = currentIndex === index;
-              const canJump = id !== 'mock-exam'; // One chance in Mock Exam
+              const canJump = id !== 'mock-exam';
               
               return (
                 <TouchableOpacity 
@@ -2670,348 +2791,350 @@ export default function ModuleScreen() {
         </View>
       )}
 
-        {((!isSummarizeGroup && !isRespondSituation && !isKeyboardVisible) || mode === 'RESULT') && (
-          <View style={[
-            styles.controls, 
-            mode === 'RESULT' && { flex: 1 },
-            mode === 'RESULT' && isAnyIncorrect && { backgroundColor: '#FEF2F2' }
-          ]}>
-             {/* TIMER */}
-             {(mode === 'RECORDING' || mode === 'PREP') && (
-               <View style={[styles.timerBox, isDescribeImage && { marginBottom: 10 }]}>
-                 <Text style={[styles.timerText, isDescribeImage && { fontSize: 12 }]}>{mode === 'PREP' ? 'Preparation' : 'Recording'}</Text>
-                 <Text style={[styles.timerCount, isDescribeImage && { fontSize: 32 }]}>{timeLeft}</Text>
-               </View>
-             )}
-             
-             {/* MAIN RESULTS BOX (Speaking/Writing) */}
-             {(mode === 'RESULT' && result && !isASQ) && (
-               <View style={[styles.resultBox, { flex: 1, paddingBottom: 0, overflow: 'hidden' }, result.overall < 50 && { backgroundColor: '#FEF2F2', borderColor: '#FECACA', borderWidth: 1 }]}>
-                  <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: 15, paddingBottom: 10 }}>
-                      <Text style={[styles.resultTitle, result.overall < 50 && { color: '#DC2626' }]}>Score: {result.overall}/90</Text>
-                      
-                      <View style={{ backgroundColor: result.overall < 50 ? '#FEE2E2' : '#EFF6FF', padding: 10, borderRadius: 8, marginBottom: 15, alignItems: 'center', borderWidth: 1, borderColor: result.overall < 50 ? '#FECACA' : '#BFDBFE' }}>
-                          <Text style={{ color: result.overall < 50 ? '#DC2626' : '#2563EB', fontWeight: 'bold', fontSize: 14 }}>
-                             Session Progress: {currentSessionScore.toFixed(0)} / {questions.length} Correct
-                          </Text>
-                      </View>
-                      
-                      <View style={{marginBottom: 15}}>
-                          {result.breakdown && Object.entries(result.breakdown).map(([k,v]:any) => {
-                             if (k.toLowerCase() === 'pronunciation' && result.overall < 50) return null;
-                             return <FeedbackRow key={k} label={k.toUpperCase()} text={v.toString()} isIncorrect={result.overall < 50} />;
-                          })}
-                      </View>
-                      
-                      <View style={{backgroundColor: result.overall < 50 ? '#FFF5F5' : '#F0FDF4', padding: 10, borderRadius: 8, borderLeftWidth: 4, borderLeftColor: result.overall < 50 ? '#EF4444' : '#059669', marginBottom: 15}}>
-                          <Text style={{fontWeight: 'bold', color: result.overall < 50 ? '#991B1B' : '#065F46', marginBottom: 5}}>Reason for Score:</Text>
-                          <Text style={{color: result.overall < 50 ? '#7F1D1D' : '#064E3B', lineHeight: 22}}>{result.feedback}</Text>
-                      </View>
-
-                      <View style={{ alignItems: 'center', paddingVertical: 10 }}>
-                          <MaterialCommunityIcons name="chevron-double-down" size={20} color="#94A3B8" />
-                          <Text style={{ fontSize: 10, color: '#94A3B8', fontWeight: 'bold' }}>SCROLL FOR MORE FEEDBACK</Text>
-                      </View>
-
-                      {result.wordAnalysis && result.wordAnalysis.length > 0 && (
-                        <View style={{backgroundColor: isDark ? colors.border : '#F1F5F9', padding: 10, borderRadius: 8, marginBottom: 15, borderWidth: 1, borderColor: isDark ? colors.border : '#E2E8F0'}}>
-                            <Text style={{fontWeight: 'bold', color: colors.text, marginBottom: 5}}>Pronunciation Heatmap (Tap word to listen):</Text>
-                            <View style={{flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center'}}>
-                                {result.wordAnalysis.map((item: any, i: number) => {
-                                    const isBad = item.health === 'bad';
-                                    return (
-                                        <TouchableOpacity 
-                                          key={i} 
-                                          onPress={() => playHeatmapWord(item.word)}
-                                          style={{ margin: 2, paddingHorizontal: 4, paddingVertical: 2, borderRadius: 4, backgroundColor: isBad ? '#FECACA' : 'transparent' }}
-                                        >
-                                          <Text style={{ 
-                                            fontSize: 16, 
-                                            color: isBad ? '#991B1B' : '#059669',
-                                            textDecorationLine: isBad ? 'underline' : 'none'
-                                          }}>
-                                            {item.word}
-                                          </Text>
-                                        </TouchableOpacity>
-                                    );
-                                })}
-                            </View>
-                            
-                            <TouchableOpacity 
-                              onPress={() => {
-                                  const targetText = currentItem.transcript || currentItem.text || currentItem.situation || currentItem.title || "";
-                                  playFullAITranscript(targetText);
-                              }}
-                              style={{marginTop: 15, backgroundColor: isGeneratingTTS ? '#E2E8F0' : '#DBEAFE', padding: 10, borderRadius: 8, flexDirection: 'row', alignItems: 'center', justifyContent: 'center'}}
-                            >
-                              <MaterialCommunityIcons name="music-clef-treble" size={18} color={isGeneratingTTS ? '#64748B' : '#2563EB'} style={{marginRight: 6}} />
-                              <Text style={{color: isGeneratingTTS ? '#64748B' : '#1D4ED8', fontWeight: 'bold', fontSize: 13}}>
-                                {isGeneratingTTS ? 'Generating Perfect AI Audio...' : 'Play Perfect AI Pronunciation'}
-                              </Text>
-                            </TouchableOpacity>
-                            
-                        </View>
-                      )}
-
-                      {result?.wordAnalysis && result.wordAnalysis.some((w: any) => w.health === 'bad') && (
-                        <View style={{backgroundColor: '#FEF2F2', padding: 12, borderRadius: 8, marginBottom: 15, borderWidth: 1, borderColor: '#FECACA'}}>
-                            <Text style={{fontWeight: 'bold', color: '#991B1B', marginBottom: 8}}>Missed / Mispronounced Words:</Text>
-                            {result.wordAnalysis.filter((w: any) => w.health === 'bad').map((item: any, idx: number) => (
-                                <TouchableOpacity key={idx} style={{flexDirection: 'row', alignItems: 'flex-start', marginBottom: 6}} onPress={() => playHeatmapWord(item.word)}>
-                                    <MaterialCommunityIcons name="close-circle-outline" size={16} color="#DC2626" style={{marginRight: 6, marginTop: 2}} />
-                                    <View style={{flex: 1}}>
-                                        <Text style={{color: '#7F1D1D', fontWeight: 'bold', fontSize: 15}}>{item.word}</Text>
-                                        {item.label && <Text style={{color: '#991B1B', fontSize: 13, marginTop: 2}}>{item.label}</Text>}
-                                    </View>
-                                </TouchableOpacity>
-                            ))}
-                        </View>
-                      )}
-
-                      {result.sectionFeedback && Object.keys(result.sectionFeedback).length > 0 && (
-                        <View style={{marginTop: 10, marginBottom: 20}}>
-                            <Text style={{fontWeight: 'bold', color: colors.text, marginBottom: 10, fontSize: 16}}>Detailed Section Feedback:</Text>
-                            {Object.entries(result.sectionFeedback).map(([key, value]: any) => (
-                                <View key={key} style={{backgroundColor: isDark ? colors.border : '#F8FAFC', padding: 12, borderRadius: 8, marginBottom: 10, borderWidth: 1, borderColor: colors.border}}>
-                                    <Text style={{fontWeight: 'bold', color: '#2563EB', textTransform: 'capitalize', marginBottom: 4}}>{key.replace(/([A-Z])/g, ' $1')}</Text>
-                                    <Text style={{color: colors.subtext, fontSize: 13, lineHeight: 18}}>{value}</Text>
-                                </View>
-                            ))}
-                        </View>
-                      )}
-
-                      {(isEssay || isDescribeImage || isSummarizeSpoken || isSummarizeWritten || isRetellLecture || isRespondSituation) && result.overall >= 50 && (
-                         <TouchableOpacity style={{marginTop: 20, alignSelf: 'center'}} onPress={() => setShowModelAnswer(true)}>
-                            <Text style={{color: '#2563EB', fontWeight:'bold', textDecorationLine: 'underline'}}>View Top Scoring Answer</Text>
-                         </TouchableOpacity>
-                      )}
-
-                      {result.pacingFeedback && (
-                         <View style={{ backgroundColor: isDark ? colors.border : '#F0F9FF', padding: 15, borderRadius: 12, marginTop: 20 }}>
-                            <Text style={{ fontWeight: 'bold', color: '#0369A1', marginBottom: 5 }}>Pacing & Delivery Tips:</Text>
-                            <Text style={{ color: colors.text, fontSize: 13, marginBottom: 3 }}>• <Text style={{fontWeight: 'bold'}}>Speed:</Text> {result.pacingFeedback.speed}</Text>
-                            <Text style={{ color: colors.text, fontSize: 13, marginBottom: 3 }}>• <Text style={{fontWeight: 'bold'}}>Pauses:</Text> {result.pacingFeedback.pauses}</Text>
-                            <Text style={{ color: colors.text, fontSize: 13 }}>• <Text style={{fontWeight: 'bold'}}>Clarity:</Text> {result.pacingFeedback.clarity}</Text>
-                         </View>
-                      )}
-                  </ScrollView>
-                  <View style={{ width: '100%', padding: 8, borderTopWidth: 1, borderColor: result.overall < 50 ? '#FECACA' : '#D1FAE5', backgroundColor: result.overall < 50 ? '#FEF2F2' : '#ECFDF5', gap: 6 }}>
-                      {result.overall < 50 && id !== 'mock-exam' && (
-                        <TouchableOpacity style={styles.btnPrimarySmall} onPress={handleResetQuestion}>
-                           <Text style={styles.btnTextSmall}>Try Again</Text>
-                        </TouchableOpacity>
-                      )}
-                      <TouchableOpacity style={styles.nextBtnSmall} onPress={handleNext}>
-                         <Text style={styles.btnTextSmall}>{(result.overall < 50 && id !== 'mock-exam') ? 'Skip to Next' : 'Next Question'}</Text>
-                         <MaterialCommunityIcons name="arrow-right" size={18} color="#fff" style={{ position: 'absolute', right: 12 }} />
-                      </TouchableOpacity>
-                  </View>
-               </View>
-             )}
-
-             {/* MULTIPLE CHOICE RESULTS BOX (Hidden Correct Answers if Wrong) */}
-             {mcResult && (
-                <View style={[
-                  styles.resultBox, 
-                  mode === 'RESULT' && { flex: 1 },
-                  mcResult.score < mcResult.max ? { backgroundColor: '#FEF2F2', borderColor: '#FECACA', borderWidth: 1 } : {}
-                ]}>
-                  <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 20 }}>
-                    <View style={{marginBottom: 10, alignItems: 'center'}}>
-                      {mcResult.score === mcResult.max ? (
-                         <View style={{flexDirection:'row', alignItems:'center', gap: 8}}>
-                            <MaterialCommunityIcons name="check-circle" size={32} color="#059669" />
-                            <Text style={{fontSize: 22, fontWeight:'bold', color: '#059669'}}>Correct!</Text>
-                         </View>
-                      ) : (
-                         <View style={{flexDirection:'row', alignItems:'center', gap: 8}}>
-                            <MaterialCommunityIcons name="close-circle" size={32} color="#DC2626" />
-                            <Text style={{fontSize: 22, fontWeight:'bold', color: '#DC2626'}}>Incorrect</Text>
-                         </View>
-                      )}
-                    </View>
-
-                    <Text style={[styles.resultTitle, {fontSize: 16, color: '#334155', textAlign: 'center'}]}>
-                      Score: {mcResult.score} / {mcResult.max}
-                    </Text>
-
-                    <View style={{ backgroundColor: mcResult.score < mcResult.max ? '#FEE2E2' : '#EFF6FF', padding: 8, borderRadius: 8, marginVertical: 10, alignItems: 'center', borderWidth: 1, borderColor: mcResult.score < mcResult.max ? '#FECACA' : '#BFDBFE' }}>
-                        <Text style={{ color: mcResult.score < mcResult.max ? '#DC2626' : '#2563EB', fontWeight: 'bold', fontSize: 14 }}>
+      {((!isSummarizeGroup && !isRespondSituation && !isKeyboardVisible) || mode === 'RESULT') && (
+        <View style={[
+          styles.controls, 
+          mode === 'RESULT' && { flex: 1 },
+          mode === 'RESULT' && isAnyIncorrect && { backgroundColor: '#FEF2F2' }
+        ]}>
+           {(mode === 'RECORDING' || mode === 'PREP') && (
+             <View style={[styles.timerBox, isDescribeImage && { marginBottom: 10 }]}>
+               <Text style={[styles.timerText, isDescribeImage && { fontSize: 12 }]}>{mode === 'PREP' ? 'Preparation' : 'Recording'}</Text>
+               <Text style={[styles.timerCount, isDescribeImage && { fontSize: 32 }]}>{timeLeft}</Text>
+             </View>
+           )}
+           
+           {(mode === 'RESULT' && result && !isASQ) && (
+             <View style={[styles.resultBox, { flex: 1, paddingBottom: 0, overflow: 'hidden' }, result.overall < 50 && { backgroundColor: '#FEF2F2', borderColor: '#FECACA', borderWidth: 1 }]}>
+                <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: 15, paddingBottom: 10 }}>
+                    <Text style={[styles.resultTitle, result.overall < 50 && { color: '#DC2626' }]}>Score: {result.overall}/90</Text>
+                    
+                    <View style={{ backgroundColor: result.overall < 50 ? '#FEE2E2' : '#EFF6FF', padding: 10, borderRadius: 8, marginBottom: 15, alignItems: 'center', borderWidth: 1, borderColor: result.overall < 50 ? '#FECACA' : '#BFDBFE' }}>
+                        <Text style={{ color: result.overall < 50 ? '#DC2626' : '#2563EB', fontWeight: 'bold', fontSize: 14 }}>
                            Session Progress: {currentSessionScore.toFixed(0)} / {questions.length} Correct
                         </Text>
                     </View>
                     
-                    {/* IF WRONG: Show encouragement to re-read/listen */}
-                    {mcResult.score < mcResult.max && (
-                       <View style={{marginTop: 10, padding: 10, backgroundColor: '#FFF5F5', borderRadius: 8}}>
-                           <Text style={{color: '#B91C1C', fontStyle: 'italic', textAlign: 'center', lineHeight: 20}}>
-                             Your answer is incorrect. Please try again.
-                           </Text>
-                       </View>
-                    )}
+                    <View style={{marginBottom: 15}}>
+                        {result.breakdown && Object.entries(result.breakdown).map(([k,v]:any) => {
+                           if (k.toLowerCase() === 'pronunciation' && result.overall < 50) return null;
+                           return <FeedbackRow key={k} label={k.toUpperCase()} text={v.toString()} isIncorrect={result.overall < 50} />;
+                        })}
+                    </View>
+                    
+                    <View style={{backgroundColor: result.overall < 50 ? '#FFF5F5' : '#F0FDF4', padding: 10, borderRadius: 8, borderLeftWidth: 4, borderLeftColor: result.overall < 50 ? '#EF4444' : '#059669', marginBottom: 15}}>
+                        <Text style={{fontWeight: 'bold', color: result.overall < 50 ? '#991B1B' : '#065F46', marginBottom: 5}}>Reason for Score:</Text>
+                        <Text style={{color: result.overall < 50 ? '#7F1D1D' : '#064E3B', lineHeight: 22}}>{result.feedback}</Text>
+                    </View>
 
-                    {/* IF CORRECT: Show the explanation */}
-                    {currentItem.explanation && mcResult.score === mcResult.max && (
-                      <View style={{ marginTop: 15, padding: 12, backgroundColor: isDark ? colors.border : '#FFFFFF', borderRadius: 8, width: '100%', borderLeftWidth: 5, borderLeftColor: '#10B981' }}>
-                        <Text style={{fontWeight: 'bold', color: colors.text, marginBottom: 4}}>Why is this correct?</Text>
-                        <Text style={{color: colors.text, lineHeight: 22}}>{currentItem.explanation}</Text>
+                    <View style={{ alignItems: 'center', paddingVertical: 10 }}>
+                        <MaterialCommunityIcons name="chevron-double-down" size={20} color="#94A3B8" />
+                        <Text style={{ fontSize: 10, color: '#94A3B8', fontWeight: 'bold' }}>SCROLL FOR MORE FEEDBACK</Text>
+                    </View>
+
+                    {result.wordAnalysis && result.wordAnalysis.length > 0 && (
+                      <View style={{backgroundColor: isDark ? colors.border : '#F1F5F9', padding: 10, borderRadius: 8, marginBottom: 15, borderWidth: 1, borderColor: isDark ? colors.border : '#E2E8F0'}}>
+                          <Text style={{fontWeight: 'bold', color: colors.text, marginBottom: 5}}>Pronunciation Heatmap (Tap word to listen):</Text>
+                          <View style={{flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center'}}>
+                              {result.wordAnalysis.map((item: any, i: number) => {
+                                  const isBad = item.health === 'bad';
+                                  return (
+                                      <TouchableOpacity 
+                                        key={i} 
+                                        onPress={() => playHeatmapWord(item.word)}
+                                        style={{ margin: 2, paddingHorizontal: 4, paddingVertical: 2, borderRadius: 4, backgroundColor: isBad ? '#FECACA' : 'transparent' }}
+                                      >
+                                        <Text style={{ 
+                                          fontSize: 16, 
+                                          color: isBad ? '#991B1B' : '#059669',
+                                          textDecorationLine: isBad ? 'underline' : 'none'
+                                        }}>
+                                          {item.word}
+                                        </Text>
+                                      </TouchableOpacity>
+                                  );
+                              })}
+                          </View>
+                          
+                          <TouchableOpacity 
+                            onPress={() => {
+                                const targetText = currentItem.transcript || currentItem.text || currentItem.situation || currentItem.title || "";
+                                playFullAITranscript(targetText);
+                            }}
+                            style={{marginTop: 15, backgroundColor: isGeneratingTTS ? '#E2E8F0' : '#DBEAFE', padding: 10, borderRadius: 8, flexDirection: 'row', alignItems: 'center', justifyContent: 'center'}}
+                          >
+                            <MaterialCommunityIcons name="music-clef-treble" size={18} color={isGeneratingTTS ? '#64748B' : '#2563EB'} style={{marginRight: 6}} />
+                            <Text style={{color: isGeneratingTTS ? '#64748B' : '#1D4ED8', fontWeight: 'bold', fontSize: 13}}>
+                              {isGeneratingTTS ? 'Generating Perfect AI Audio...' : 'Play Perfect AI Pronunciation'}
+                            </Text>
+                          </TouchableOpacity>
+                          
                       </View>
                     )}
-                  </ScrollView>
 
-                  <View style={{ marginTop: 15, gap: 8, width: '100%', padding: 12, backgroundColor: mcResult.score < mcResult.max ? '#FEF2F2' : '#ECFDF5', borderTopWidth: 1, borderColor: mcResult.score < mcResult.max ? '#FECACA' : '#D1FAE5', borderRadius: 16 }}>
-                    {mcResult.score < mcResult.max && id !== 'mock-exam' && (
+                    {result?.wordAnalysis && result.wordAnalysis.some((w: any) => w.health === 'bad') && (
+                      <View style={{backgroundColor: '#FEF2F2', padding: 12, borderRadius: 8, marginBottom: 15, borderWidth: 1, borderColor: '#FECACA'}}>
+                          <Text style={{fontWeight: 'bold', color: '#991B1B', marginBottom: 8}}>Missed / Mispronounced Words:</Text>
+                          {result.wordAnalysis.filter((w: any) => w.health === 'bad').map((item: any, idx: number) => (
+                              <TouchableOpacity key={idx} style={{flexDirection: 'row', alignItems: 'flex-start', marginBottom: 6}} onPress={() => playHeatmapWord(item.word)}>
+                                  <MaterialCommunityIcons name="close-circle-outline" size={16} color="#DC2626" style={{marginRight: 6, marginTop: 2}} />
+                                  <View style={{flex: 1}}>
+                                      <Text style={{color: '#7F1D1D', fontWeight: 'bold', fontSize: 15}}>{item.word}</Text>
+                                      {item.label && <Text style={{color: '#991B1B', fontSize: 13, marginTop: 2}}>{item.label}</Text>}
+                                  </View>
+                              </TouchableOpacity>
+                          ))}
+                      </View>
+                    )}
+
+                    {result.sectionFeedback && Object.keys(result.sectionFeedback).length > 0 && (
+                      <View style={{marginTop: 10, marginBottom: 20}}>
+                          <Text style={{fontWeight: 'bold', color: colors.text, marginBottom: 10, fontSize: 16}}>Detailed Section Feedback:</Text>
+                          {Object.entries(result.sectionFeedback).map(([key, value]: any) => (
+                              <View key={key} style={{backgroundColor: isDark ? colors.border : '#F8FAFC', padding: 12, borderRadius: 8, marginBottom: 10, borderWidth: 1, borderColor: colors.border}}>
+                                  <Text style={{fontWeight: 'bold', color: '#2563EB', textTransform: 'capitalize', marginBottom: 4}}>{key.replace(/([A-Z])/g, ' $1')}</Text>
+                                  <Text style={{color: colors.subtext, fontSize: 13, lineHeight: 18}}>{value}</Text>
+                              </View>
+                          ))}
+                      </View>
+                    )}
+
+                    {(isEssay || isDescribeImage || isSummarizeSpoken || isSummarizeWritten || isRetellLecture || isRespondSituation) && result.overall >= 50 && (
+                       <TouchableOpacity style={{marginTop: 20, alignSelf: 'center'}} onPress={() => setShowModelAnswer(true)}>
+                          <Text style={{color: '#2563EB', fontWeight:'bold', textDecorationLine: 'underline'}}>View Top Scoring Answer</Text>
+                       </TouchableOpacity>
+                    )}
+
+                    {result.pacingFeedback && (
+                       <View style={{ backgroundColor: isDark ? colors.border : '#F0F9FF', padding: 15, borderRadius: 12, marginTop: 20 }}>
+                          <Text style={{ fontWeight: 'bold', color: '#0369A1', marginBottom: 5 }}>Pacing & Delivery Tips:</Text>
+                          <Text style={{ color: colors.text, fontSize: 13, marginBottom: 3 }}>• <Text style={{fontWeight: 'bold'}}>Speed:</Text> {result.pacingFeedback.speed}</Text>
+                          <Text style={{ color: colors.text, fontSize: 13, marginBottom: 3 }}>• <Text style={{fontWeight: 'bold'}}>Pauses:</Text> {result.pacingFeedback.pauses}</Text>
+                          <Text style={{ color: colors.text, fontSize: 13 }}>• <Text style={{fontWeight: 'bold'}}>Clarity:</Text> {result.pacingFeedback.clarity}</Text>
+                       </View>
+                    )}
+                </ScrollView>
+                <View style={{ width: '100%', padding: 8, borderTopWidth: 1, borderColor: result.overall < 50 ? '#FECACA' : '#D1FAE5', backgroundColor: result.overall < 50 ? '#FEF2F2' : '#ECFDF5', gap: 6 }}>
+                    {result.overall < 50 && id !== 'mock-exam' && (
                       <TouchableOpacity style={styles.btnPrimarySmall} onPress={handleResetQuestion}>
                          <Text style={styles.btnTextSmall}>Try Again</Text>
                       </TouchableOpacity>
                     )}
                     <TouchableOpacity style={styles.nextBtnSmall} onPress={handleNext}>
-                       <Text style={styles.btnTextSmall}>{(mcResult.score < mcResult.max && id !== 'mock-exam') ? 'Skip to Next' : 'Next Question'}</Text>
-                       <MaterialCommunityIcons name="arrow-right" size={20} color="#fff" style={{ position: 'absolute', right: 15 }} />
+                       <Text style={styles.btnTextSmall}>{(result.overall < 50 && id !== 'mock-exam') ? 'Skip to Next' : 'Next Question'}</Text>
+                       <MaterialCommunityIcons name="arrow-right" size={18} color="#fff" style={{ position: 'absolute', right: 12 }} />
                     </TouchableOpacity>
-                  </View>
                 </View>
-             )}
+             </View>
+           )}
 
-             {/* DICTATION RESULT BOX */}
-             {dictationResult && (
-                <View style={[styles.resultBox, dictationResult.score < dictationResult.max && { backgroundColor: '#FEF2F2', borderColor: '#FECACA', borderWidth: 1 }]}>
-                    <Text style={[styles.resultTitle, dictationResult.score < dictationResult.max && { color: '#DC2626' }]}>Score: {dictationResult.score} / {dictationResult.max}</Text>
-                    
-                    <View style={{ backgroundColor: dictationResult.score < dictationResult.max ? '#FEE2E2' : '#EFF6FF', padding: 8, borderRadius: 8, marginBottom: 15, alignItems: 'center', borderWidth: 1, borderColor: dictationResult.score < dictationResult.max ? '#FECACA' : '#BFDBFE' }}>
-                        <Text style={{ color: dictationResult.score < dictationResult.max ? '#DC2626' : '#2563EB', fontWeight: 'bold', fontSize: 14 }}>
-                           Session Progress: {currentSessionScore.toFixed(0)} / {questions.length} Correct
-                        </Text>
-                    </View>
-                    
-                    {dictationResult.score === dictationResult.max && (
-                      <>
-                        <Text style={styles.resultSub}>Correct Answer:</Text>
-                        <Text style={{color:'#065F46', fontStyle:'italic'}}>{dictationResult.original}</Text>
-                      </>
+           {mcResult && (
+              <View style={[styles.resultBox, mode === 'RESULT' && { flex: 1 }, mcResult.score < mcResult.max ? { backgroundColor: '#FEF2F2', borderColor: '#FECACA', borderWidth: 1 } : {}]}>
+                <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 20 }}>
+                  <View style={{marginBottom: 10, alignItems: 'center'}}>
+                    {mcResult.score === mcResult.max ? (
+                       <View style={{flexDirection:'row', alignItems:'center', gap: 8}}>
+                          <MaterialCommunityIcons name="check-circle" size={32} color="#059669" />
+                          <Text style={{fontSize: 22, fontWeight:'bold', color: '#059669'}}>Correct!</Text>
+                       </View>
+                    ) : (
+                       <View style={{flexDirection:'row', alignItems:'center', gap: 8}}>
+                          <MaterialCommunityIcons name="close-circle" size={32} color="#DC2626" />
+                          <Text style={{fontSize: 22, fontWeight:'bold', color: '#DC2626'}}>Incorrect</Text>
+                       </View>
                     )}
+                  </View>
 
-                    <View style={{ gap: 8, width: '100%', padding: 12, backgroundColor: dictationResult.score < dictationResult.max ? '#FEF2F2' : '#ECFDF5', borderTopWidth: 1, borderColor: dictationResult.score < dictationResult.max ? '#FECACA' : '#D1FAE5', borderRadius: 16 }}>
-                        {dictationResult.score < dictationResult.max && id !== 'mock-exam' && (
-                            <TouchableOpacity style={styles.btnPrimarySmall} onPress={handleResetQuestion}>
-                                <Text style={styles.btnTextSmall}>Try Again</Text>
-                            </TouchableOpacity>
-                        )}
-                        <TouchableOpacity style={styles.nextBtnSmall} onPress={handleNext}>
-                            <Text style={styles.btnTextSmall}>{(dictationResult.score < dictationResult.max && id !== 'mock-exam') ? 'Skip to Next' : 'Next Question'}</Text>
-                            <MaterialCommunityIcons name="arrow-right" size={20} color="#fff" style={{ position: 'absolute', right: 15 }} />
-                        </TouchableOpacity>
-                    </View>
-                </View>
-             )}
+                  <Text style={[styles.resultTitle, {fontSize: 16, color: '#334155', textAlign: 'center'}]}>
+                    Score: {mcResult.score} / {mcResult.max}
+                  </Text>
 
-             {/* OTHER RESULTS (Highlight/Blanks/Reorder) */}
-             {highlightResult && (
-                <View style={[styles.resultBox, highlightResult.score < highlightResult.max && { backgroundColor: '#FEF2F2', borderColor: '#FECACA', borderWidth: 1 }]}>
-                  <Text style={[styles.resultTitle, highlightResult.score < highlightResult.max && { color: '#DC2626' }]}>Score: {highlightResult.score}/{highlightResult.max}</Text>
-                  
-                  <View style={{ backgroundColor: highlightResult.score < highlightResult.max ? '#FEE2E2' : '#EFF6FF', padding: 8, borderRadius: 8, marginBottom: 10, alignItems: 'center', borderWidth: 1, borderColor: highlightResult.score < highlightResult.max ? '#FECACA' : '#BFDBFE' }}>
-                      <Text style={{ color: highlightResult.score < highlightResult.max ? '#DC2626' : '#2563EB', fontWeight: 'bold', fontSize: 14 }}>
+                  <View style={{ backgroundColor: mcResult.score < mcResult.max ? '#FEE2E2' : '#EFF6FF', padding: 8, borderRadius: 8, marginVertical: 10, alignItems: 'center', borderWidth: 1, borderColor: mcResult.score < mcResult.max ? '#FECACA' : '#BFDBFE' }}>
+                      <Text style={{ color: mcResult.score < mcResult.max ? '#DC2626' : '#2563EB', fontWeight: 'bold', fontSize: 14 }}>
                          Session Progress: {currentSessionScore.toFixed(0)} / {questions.length} Correct
                       </Text>
                   </View>
                   
-                  {highlightResult.score < highlightResult.max && (
-                    <Text style={[styles.resultSub, { color: '#991B1B' }]}>Please try again</Text>
+                  {mcResult.score < mcResult.max && (
+                     <View style={{marginTop: 10, padding: 10, backgroundColor: '#FFF5F5', borderRadius: 8}}>
+                         <Text style={{color: '#B91C1C', fontStyle: 'italic', textAlign: 'center', lineHeight: 20}}>
+                           Your answer is incorrect. Please try again.
+                         </Text>
+                     </View>
                   )}
-                  <View style={{ marginTop: 15, gap: 8, width: '100%', padding: 12, backgroundColor: highlightResult.score < highlightResult.max ? '#FEF2F2' : '#ECFDF5', borderTopWidth: 1, borderColor: highlightResult.score < highlightResult.max ? '#FECACA' : '#D1FAE5', borderRadius: 16 }}>
-                    {highlightResult.score < highlightResult.max && id !== 'mock-exam' && (
-                        <TouchableOpacity style={styles.btnPrimarySmall} onPress={handleResetQuestion}>
-                           <Text style={styles.btnTextSmall}>Try Again</Text>
-                        </TouchableOpacity>
-                    )}
-                    <TouchableOpacity style={styles.nextBtnSmall} onPress={handleNext}>
-                        <Text style={styles.btnTextSmall}>{(highlightResult.score < highlightResult.max && id !== 'mock-exam') ? 'Skip to Next' : 'Next Question'}</Text>
-                        <MaterialCommunityIcons name="arrow-right" size={20} color="#fff" style={{ position: 'absolute', right: 15 }} />
+
+                  {currentItem.explanation && mcResult.score === mcResult.max && (
+                    <View style={{ marginTop: 15, padding: 12, backgroundColor: isDark ? colors.border : '#FFFFFF', borderRadius: 8, width: '100%', borderLeftWidth: 5, borderLeftColor: '#10B981' }}>
+                      <Text style={{fontWeight: 'bold', color: colors.text, marginBottom: 4}}>Why is this correct?</Text>
+                      <Text style={{color: colors.text, lineHeight: 22}}>{currentItem.explanation}</Text>
+                    </View>
+                  )}
+                </ScrollView>
+
+                <View style={{ marginTop: 15, gap: 8, width: '100%', padding: 12, backgroundColor: mcResult.score < mcResult.max ? '#FEF2F2' : '#ECFDF5', borderTopWidth: 1, borderColor: mcResult.score < mcResult.max ? '#FECACA' : '#D1FAE5', borderRadius: 16 }}>
+                  {mcResult.score < mcResult.max && id !== 'mock-exam' && (
+                    <TouchableOpacity style={styles.btnPrimarySmall} onPress={handleResetQuestion}>
+                       <Text style={styles.btnTextSmall}>Try Again</Text>
                     </TouchableOpacity>
-                  </View>
+                  )}
+                  <TouchableOpacity style={styles.nextBtnSmall} onPress={handleNext}>
+                     <Text style={styles.btnTextSmall}>{(mcResult.score < mcResult.max && id !== 'mock-exam') ? 'Skip to Next' : 'Next Question'}</Text>
+                     <MaterialCommunityIcons name="arrow-right" size={20} color="#fff" style={{ position: 'absolute', right: 15 }} />
+                  </TouchableOpacity>
                 </View>
-              )}
-             {(reOrderScore || fillBlankScore || rwResult || lFibResult) && (
-                <View style={[
-                  styles.resultBox, 
-                  mode === 'RESULT' && { flex: 1 },
-                  isAnyIncorrect && { backgroundColor: '#FEF2F2', borderColor: '#FECACA', borderWidth: 1 }
-                ]}>
-                  <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 20 }}>
-                    <View style={{marginBottom: 10, alignItems: 'center'}}>
-                      {!isAnyIncorrect ? (
-                         <View style={{flexDirection:'row', alignItems:'center', gap: 8}}>
-                            <MaterialCommunityIcons name="check-circle" size={32} color="#059669" />
-                            <Text style={{fontSize: 22, fontWeight:'bold', color: '#059669'}}>Correct!</Text>
-                         </View>
-                      ) : (
-                         <View style={{flexDirection:'row', alignItems:'center', gap: 8}}>
-                            <MaterialCommunityIcons name="close-circle" size={32} color="#DC2626" />
-                            <Text style={{fontSize: 22, fontWeight:'bold', color: '#DC2626'}}>Incorrect</Text>
-                         </View>
+              </View>
+           )}
+
+           {dictationResult && (
+              <View style={[styles.resultBox, dictationResult.score < dictationResult.max && { backgroundColor: '#FEF2F2', borderColor: '#FECACA', borderWidth: 1 }]}>
+                  <Text style={[styles.resultTitle, dictationResult.score < dictationResult.max && { color: '#DC2626' }]}>Score: {dictationResult.score} / {dictationResult.max}</Text>
+                  
+                  <View style={{ backgroundColor: dictationResult.score < dictationResult.max ? '#FEE2E2' : '#EFF6FF', padding: 8, borderRadius: 8, marginBottom: 15, alignItems: 'center', borderWidth: 1, borderColor: dictationResult.score < dictationResult.max ? '#FECACA' : '#BFDBFE' }}>
+                      <Text style={{ color: dictationResult.score < dictationResult.max ? '#DC2626' : '#2563EB', fontWeight: 'bold', fontSize: 14 }}>
+                         Session Progress: {currentSessionScore.toFixed(0)} / {questions.length} Correct
+                      </Text>
+                  </View>
+                  
+                  {dictationResult.score === dictationResult.max && (
+                    <>
+                      <Text style={styles.resultSub}>Correct Answer:</Text>
+                      <Text style={{color:'#065F46', fontStyle:'italic'}}>{dictationResult.original}</Text>
+                    </>
+                  )}
+
+                  <View style={{ gap: 8, width: '100%', padding: 12, backgroundColor: dictationResult.score < dictationResult.max ? '#FEF2F2' : '#ECFDF5', borderTopWidth: 1, borderColor: dictationResult.score < dictationResult.max ? '#FECACA' : '#D1FAE5', borderRadius: 16 }}>
+                      {dictationResult.score < dictationResult.max && id !== 'mock-exam' && (
+                          <TouchableOpacity style={styles.btnPrimarySmall} onPress={handleResetQuestion}>
+                              <Text style={styles.btnTextSmall}>Try Again</Text>
+                          </TouchableOpacity>
                       )}
-                    </View>
+                      <TouchableOpacity style={styles.nextBtnSmall} onPress={handleNext}>
+                          <Text style={styles.btnTextSmall}>{(dictationResult.score < dictationResult.max && id !== 'mock-exam') ? 'Skip to Next' : 'Next Question'}</Text>
+                          <MaterialCommunityIcons name="arrow-right" size={20} color="#fff" style={{ position: 'absolute', right: 15 }} />
+                      </TouchableOpacity>
+                  </View>
+              </View>
+           )}
 
-                    <Text style={[styles.resultTitle, {fontSize: 16, color: '#334155', textAlign: 'center'}]}>
-                      Score: {reOrderScore ? reOrderScore.score : fillBlankScore ? fillBlankScore.score : rwResult ? rwResult.score : (lFibResult?.score ?? 0)} / {reOrderScore ? reOrderScore.max : fillBlankScore ? fillBlankScore.max : rwResult ? rwResult.max : (lFibResult?.max ?? 0)}
+           {highlightResult && (
+              <View style={[styles.resultBox, highlightResult.score < highlightResult.max && { backgroundColor: '#FEF2F2', borderColor: '#FECACA', borderWidth: 1 }]}>
+                <Text style={[styles.resultTitle, highlightResult.score < highlightResult.max && { color: '#DC2626' }]}>Score: {highlightResult.score}/{highlightResult.max}</Text>
+                
+                <View style={{ backgroundColor: highlightResult.score < highlightResult.max ? '#FEE2E2' : '#EFF6FF', padding: 8, borderRadius: 8, marginBottom: 10, alignItems: 'center', borderWidth: 1, borderColor: highlightResult.score < highlightResult.max ? '#FECACA' : '#BFDBFE' }}>
+                    <Text style={{ color: highlightResult.score < highlightResult.max ? '#DC2626' : '#2563EB', fontWeight: 'bold', fontSize: 14 }}>
+                       Session Progress: {currentSessionScore.toFixed(0)} / {questions.length} Correct
                     </Text>
-                    
-                    <View style={{ backgroundColor: isAnyIncorrect ? '#FEE2E2' : '#EFF6FF', padding: 8, borderRadius: 8, marginVertical: 10, alignItems: 'center', borderWidth: 1, borderColor: isAnyIncorrect ? '#FECACA' : '#BFDBFE' }}>
-                        <Text style={{ color: isAnyIncorrect ? '#DC2626' : '#2563EB', fontWeight: 'bold', fontSize: 14 }}>
-                           Session Progress: {currentSessionScore.toFixed(0)} / {questions.length} Correct
-                        </Text>
-                    </View>
-
-                    {isAnyIncorrect && (
-                       <View style={{marginTop: 10, padding: 10, backgroundColor: '#FFF5F5', borderRadius: 8}}>
-                           <Text style={{color: '#B91C1C', fontStyle: 'italic', textAlign: 'center', lineHeight: 20}}>
-                             Your answer is incorrect. Please try again.
-                           </Text>
+                </View>
+                
+                {highlightResult.score < highlightResult.max && (
+                  <Text style={[styles.resultSub, { color: '#991B1B' }]}>Please try again</Text>
+                )}
+                <View style={{ marginTop: 15, gap: 8, width: '100%', padding: 12, backgroundColor: highlightResult.score < highlightResult.max ? '#FEF2F2' : '#ECFDF5', borderTopWidth: 1, borderColor: highlightResult.score < highlightResult.max ? '#FECACA' : '#D1FAE5', borderRadius: 16 }}>
+                  {highlightResult.score < highlightResult.max && id !== 'mock-exam' && (
+                      <TouchableOpacity style={styles.btnPrimarySmall} onPress={handleResetQuestion}>
+                         <Text style={styles.btnTextSmall}>Try Again</Text>
+                      </TouchableOpacity>
+                  )}
+                  <TouchableOpacity style={styles.nextBtnSmall} onPress={handleNext}>
+                      <Text style={styles.btnTextSmall}>{(highlightResult.score < highlightResult.max && id !== 'mock-exam') ? 'Skip to Next' : 'Next Question'}</Text>
+                      <MaterialCommunityIcons name="arrow-right" size={20} color="#fff" style={{ position: 'absolute', right: 15 }} />
+                  </TouchableOpacity>
+                </View>
+              </View>
+            )}
+           {(reOrderScore || fillBlankScore || rwResult || lFibResult) && (
+              <View style={[styles.resultBox, mode === 'RESULT' && { flex: 1 }, isAnyIncorrect && { backgroundColor: '#FEF2F2', borderColor: '#FECACA', borderWidth: 1 }]}>
+                <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 20 }}>
+                  <View style={{marginBottom: 10, alignItems: 'center'}}>
+                    {!isAnyIncorrect ? (
+                       <View style={{flexDirection:'row', alignItems:'center', gap: 8}}>
+                          <MaterialCommunityIcons name="check-circle" size={32} color="#059669" />
+                          <Text style={{fontSize: 22, fontWeight:'bold', color: '#059669'}}>Correct!</Text>
+                       </View>
+                    ) : (
+                       <View style={{flexDirection:'row', alignItems:'center', gap: 8}}>
+                          <MaterialCommunityIcons name="close-circle" size={32} color="#DC2626" />
+                          <Text style={{fontSize: 22, fontWeight:'bold', color: '#DC2626'}}>Incorrect</Text>
                        </View>
                     )}
+                  </View>
 
-                    {/* LISTENING FIB DETAILED FEEDBACK */}
-                    {isFillBlanksListening && lFibResult && (
-                      <View style={{ width: '100%', marginTop: 10, padding: 10, backgroundColor: colors.surface, borderRadius: 12, borderWidth: 1, borderColor: isAnyIncorrect ? '#FECACA' : '#D1FAE5' }}>
-                        <Text style={{ fontWeight: 'bold', color: colors.text, marginBottom: 10 }}>Results & Feedback:</Text>
-                        <View style={{flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', rowGap: 12}}>
-                          {currentItem.segments.flatMap((segment: string, i: number) => {
-                            const words = segment.replace(/\s+/g, ' ').trim().split(' ');
-                            
-                            const wordNodes = words.map((word, wIndex) => (
-                              word.length > 0 ? (
-                                <Text key={`res-text-${i}-${wIndex}`} style={[styles.fibText, {fontSize: 14, marginVertical: 2, marginRight: 4}]}>
-                                  {word}
+                  <Text style={[styles.resultTitle, {fontSize: 16, color: '#334155', textAlign: 'center'}]}>
+                    Score: {reOrderScore ? reOrderScore.score : fillBlankScore ? fillBlankScore.score : rwResult ? rwResult.score : (lFibResult?.score ?? 0)} / {reOrderScore ? reOrderScore.max : fillBlankScore ? fillBlankScore.max : rwResult ? rwResult.max : (lFibResult?.max ?? 0)}
+                  </Text>
+                  
+                  <View style={{ backgroundColor: isAnyIncorrect ? '#FEE2E2' : '#EFF6FF', padding: 8, borderRadius: 8, marginVertical: 10, alignItems: 'center', borderWidth: 1, borderColor: isAnyIncorrect ? '#FECACA' : '#BFDBFE' }}>
+                      <Text style={{ color: isAnyIncorrect ? '#DC2626' : '#2563EB', fontWeight: 'bold', fontSize: 14 }}>
+                         Session Progress: {currentSessionScore.toFixed(0)} / {questions.length} Correct
+                      </Text>
+                  </View>
+
+                  {isAnyIncorrect && (
+                     <View style={{marginTop: 10, padding: 10, backgroundColor: '#FFF5F5', borderRadius: 8}}>
+                         <Text style={{color: '#B91C1C', fontStyle: 'italic', textAlign: 'center', lineHeight: 20}}>
+                           Your answer is incorrect. Please try again.
+                         </Text>
+                     </View>
+                  )}
+
+                  {isFillBlanksListening && lFibResult && (
+                    <View style={{ width: '100%', marginTop: 10, padding: 10, backgroundColor: colors.surface, borderRadius: 12, borderWidth: 1, borderColor: isAnyIncorrect ? '#FECACA' : '#D1FAE5' }}>
+                      <Text style={{ fontWeight: 'bold', color: colors.text, marginBottom: 10 }}>Results & Feedback:</Text>
+                      <View style={{flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', rowGap: 12}}>
+                        {currentItem.segments.flatMap((segment: string, i: number) => {
+                          const words = segment.replace(/\s+/g, ' ').trim().split(' ');
+                          
+                          const wordNodes = words.map((word, wIndex) => (
+                            word.length > 0 ? (
+                              <Text key={`res-text-${i}-${wIndex}`} style={[styles.fibText, {fontSize: 14, marginVertical: 2, marginRight: 4}]}>
+                                {word}
+                              </Text>
+                            ) : null
+                          ));
+
+                          const answerNode = i < currentItem.segments.length - 1 ? (
+                            <View key={`res-ans-${i}`} style={{marginHorizontal: 4, marginVertical: 2, alignItems: 'center'}}>
+                              <View style={[styles.inlineInput, { width: 'auto', minWidth: 60, paddingHorizontal: 8, height: 30, justifyContent: 'center' }, lFibAnswers[i]?.trim().toLowerCase() === currentItem.correctAnswers[i]?.toLowerCase() ? styles.inputCorrect : styles.inputWrong]}>
+                                <Text style={{ fontSize: 14, fontWeight: 'bold', color: lFibAnswers[i]?.trim().toLowerCase() === currentItem.correctAnswers[i]?.toLowerCase() ? '#065F46' : '#991B1B' }}>
+                                  {lFibAnswers[i] || '___'}
                                 </Text>
-                              ) : null
-                            ));
+                              </View>
+                              {lFibAnswers[i]?.trim().toLowerCase() !== currentItem.correctAnswers[i]?.toLowerCase() && (
+                                <Text style={{opacity: 0, fontSize: 12, fontWeight: 'bold', marginTop: 2}}>{currentItem.correctAnswers[i]}</Text>
+                              )}
+                            </View>
+                          ) : null;
+                          
+                          return [...wordNodes, answerNode];
+                        })}
+                      </View>
+                    </View>
+                  )}
 
-                            const answerNode = i < currentItem.segments.length - 1 ? (
-                              <View key={`res-ans-${i}`} style={{marginHorizontal: 4, marginVertical: 2, alignItems: 'center'}}>
-                                <View style={[
-                                  styles.inlineInput, 
-                                  { width: 'auto', minWidth: 60, paddingHorizontal: 8, height: 30, justifyContent: 'center' },
-                                  lFibAnswers[i]?.trim().toLowerCase() === currentItem.correctAnswers[i]?.toLowerCase() ? styles.inputCorrect : styles.inputWrong
-                                ]}>
-                                  <Text style={{ fontSize: 14, fontWeight: 'bold', color: lFibAnswers[i]?.trim().toLowerCase() === currentItem.correctAnswers[i]?.toLowerCase() ? '#065F46' : '#991B1B' }}>
-                                    {lFibAnswers[i] || '___'}
-                                  </Text>
+                  {isFillBlanks && fillBlankScore && (
+                    <View style={{ width: '100%', marginTop: 10, padding: 10, backgroundColor: colors.surface, borderRadius: 12, borderWidth: 1, borderColor: isAnyIncorrect ? '#FECACA' : '#D1FAE5' }}>
+                      <Text style={{ fontWeight: 'bold', color: colors.text, marginBottom: 10 }}>Results & Feedback:</Text>
+                      <View style={{flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', rowGap: 12}}>
+                        {currentItem.segments.map((segment: string, i: number) => (
+                          <View key={`seg-${i}`} style={{flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap'}}>
+                            <Text style={[styles.fibText, {fontSize: 14}]}>{segment}</Text>
+                            {i < currentItem.segments.length - 1 && (
+                              <View style={{alignItems: 'center', marginHorizontal: 4}}>
+                                <View style={[styles.blankBox, { paddingHorizontal: 8, height: 26, justifyContent: 'center', alignItems: 'center', marginVertical: 0 }, blankAnswers[i] === currentItem.correctAnswers[i] ? styles.blankCorrect : styles.blankWrong]}>
+                                  <Text style={{ fontSize: 14, color: '#fff', fontWeight: 'bold' }}>{blankAnswers[i] || '___'}</Text>
                                 </View>
-                                {lFibAnswers[i]?.trim().toLowerCase() !== currentItem.correctAnswers[i]?.toLowerCase() && (
+                                {blankAnswers[i] !== currentItem.correctAnswers[i] && (
                                   <Text style={{opacity: 0, fontSize: 12, fontWeight: 'bold', marginTop: 2}}>{currentItem.correctAnswers[i]}</Text>
                                 )}
                               </View>
-                            ) : null;
-                            
-                            return [...wordNodes, answerNode];
-                          })}
-                        </View>
+                            )}
+                          </View>
+                        ))}
                       </View>
-                    )}
+                    </View>
+                  )}
 
-                    {/* READING FIB DETAILED FEEDBACK */}
-                    {isFillBlanks && fillBlankScore && (
+                  {isFillBlanksRW && rwResult && (
                       <View style={{ width: '100%', marginTop: 10, padding: 10, backgroundColor: colors.surface, borderRadius: 12, borderWidth: 1, borderColor: isAnyIncorrect ? '#FECACA' : '#D1FAE5' }}>
                         <Text style={{ fontWeight: 'bold', color: colors.text, marginBottom: 10 }}>Results & Feedback:</Text>
                         <View style={{flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', rowGap: 12}}>
@@ -3020,40 +3143,7 @@ export default function ModuleScreen() {
                               <Text style={[styles.fibText, {fontSize: 14}]}>{segment}</Text>
                               {i < currentItem.segments.length - 1 && (
                                 <View style={{alignItems: 'center', marginHorizontal: 4}}>
-                                  <View style={[
-                                      styles.blankBox, 
-                                      { paddingHorizontal: 8, height: 26, justifyContent: 'center', alignItems: 'center', marginVertical: 0 },
-                                      blankAnswers[i] === currentItem.correctAnswers[i] ? styles.blankCorrect : styles.blankWrong
-                                    ]}
-                                  >
-                                    <Text style={{ fontSize: 14, color: '#fff', fontWeight: 'bold' }}>{blankAnswers[i] || '___'}</Text>
-                                  </View>
-                                  {blankAnswers[i] !== currentItem.correctAnswers[i] && (
-                                    <Text style={{opacity: 0, fontSize: 12, fontWeight: 'bold', marginTop: 2}}>{currentItem.correctAnswers[i]}</Text>
-                                  )}
-                                </View>
-                              )}
-                            </View>
-                          ))}
-                        </View>
-                      </View>
-                    )}
-
-                    {/* READING & WRITING FIB DETAILED FEEDBACK */}
-                    {isFillBlanksRW && rwResult && (
-                      <View style={{ width: '100%', marginTop: 10, padding: 10, backgroundColor: colors.surface, borderRadius: 12, borderWidth: 1, borderColor: isAnyIncorrect ? '#FECACA' : '#D1FAE5' }}>
-                        <Text style={{ fontWeight: 'bold', color: colors.text, marginBottom: 10 }}>Results & Feedback:</Text>
-                        <View style={{flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', rowGap: 12}}>
-                          {currentItem.segments.map((segment: string, i: number) => (
-                            <View key={`seg-${i}`} style={{flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap'}}>
-                              <Text style={[styles.fibText, {fontSize: 14}]}>{segment}</Text>
-                              {i < currentItem.segments.length - 1 && (
-                                <View style={{alignItems: 'center', marginHorizontal: 4}}>
-                                  <View style={[
-                                    styles.inlineInput, 
-                                    { width: 'auto', minWidth: 60, paddingHorizontal: 8, height: 30, justifyContent: 'center' },
-                                    rwAnswers[i]?.trim().toLowerCase() === currentItem.correctAnswers[i].toLowerCase() ? styles.inputCorrect : styles.inputWrong
-                                  ]}>
+                                  <View style={[styles.inlineInput, { width: 'auto', minWidth: 60, paddingHorizontal: 8, height: 30, justifyContent: 'center' }, rwAnswers[i]?.trim().toLowerCase() === currentItem.correctAnswers[i].toLowerCase() ? styles.inputCorrect : styles.inputWrong]}>
                                     <Text style={{ fontSize: 14, fontWeight: 'bold', color: rwAnswers[i]?.trim().toLowerCase() === currentItem.correctAnswers[i].toLowerCase() ? '#065F46' : '#991B1B' }}>
                                       {rwAnswers[i] || '___'}
                                     </Text>
@@ -3068,104 +3158,72 @@ export default function ModuleScreen() {
                         </View>
                       </View>
                     )}
-
-                    {/* RE-ORDER DETAILED FEEDBACK */}
-                    {isReOrder && reOrderScore && reOrderScore.score === reOrderScore.max && (
-                      <View style={{ width: '100%', marginTop: 10 }}>
-                          <View style={{ marginTop: 10, padding: 10, backgroundColor: colors.surface, borderRadius: 12, borderWidth: 1, borderColor: '#D1FAE5' }}>
-                              <Text style={{ fontWeight: 'bold', color: colors.text, marginBottom: 10 }}>Correct Order:</Text>
-                              {currentItem.sentences?.map((sentence: string, idx: number) => (
-                                  <View key={idx} style={[styles.reOrderResultItem, { backgroundColor: '#F0FDF4', borderColor: '#D1FAE5' }]}>
-                                      <Text style={{ color: '#065F46' }}>{idx + 1}. {sentence}</Text>
-                                  </View>
-                              ))}
-                          </View>
-                      </View>
-                    )}
-                  </ScrollView>
-                  
-                   <View style={{ marginTop: 15, gap: 8, width: '100%', padding: 12, backgroundColor: isAnyIncorrect ? '#FEF2F2' : '#ECFDF5', borderTopWidth: 1, borderColor: isAnyIncorrect ? '#FECACA' : '#D1FAE5', borderRadius: 16 }}>
-                    {isAnyIncorrect && id !== 'mock-exam' && (
-                        <TouchableOpacity style={styles.btnPrimarySmall} onPress={handleResetQuestion}>
-                           <Text style={styles.btnTextSmall}>Try Again</Text>
-                        </TouchableOpacity>
-                    )}
-                    <TouchableOpacity style={styles.nextBtnSmall} onPress={handleNext}>
-                        <Text style={styles.btnTextSmall}>{(isAnyIncorrect && id !== 'mock-exam') ? 'Skip to Next' : 'Next Question'}</Text>
-                        <MaterialCommunityIcons name="arrow-right" size={20} color="#fff" style={{ position: 'absolute', right: 15 }} />
-                    </TouchableOpacity>
-                  </View>
+                  {isReOrder && reOrderScore && reOrderScore.score === reOrderScore.max && (
+                    <View style={{ width: '100%', marginTop: 10 }}>
+                        <View style={{ marginTop: 10, padding: 10, backgroundColor: colors.surface, borderRadius: 12, borderWidth: 1, borderColor: '#D1FAE5' }}>
+                            <Text style={{ fontWeight: 'bold', color: colors.text, marginBottom: 10 }}>Correct Order:</Text>
+                            {currentItem.sentences?.map((sentence: string, idx: number) => (
+                                <View key={idx} style={[styles.reOrderResultItem, { backgroundColor: '#F0FDF4', borderColor: '#D1FAE5' }]}>
+                                    <Text style={{ color: '#065F46' }}>{idx + 1}. {sentence}</Text>
+                                </View>
+                            ))}
+                        </View>
+                    </View>
+                  )}
+                </ScrollView>
+                
+                 <View style={{ marginTop: 15, gap: 8, width: '100%', padding: 12, backgroundColor: isAnyIncorrect ? '#FEF2F2' : '#ECFDF5', borderTopWidth: 1, borderColor: isAnyIncorrect ? '#FECACA' : '#D1FAE5', borderRadius: 16 }}>
+                  {isAnyIncorrect && id !== 'mock-exam' && (
+                      <TouchableOpacity style={styles.btnPrimarySmall} onPress={handleResetQuestion}>
+                         <Text style={styles.btnTextSmall}>Try Again</Text>
+                      </TouchableOpacity>
+                  )}
+                  <TouchableOpacity style={styles.nextBtnSmall} onPress={handleNext}>
+                      <Text style={styles.btnTextSmall}>{(isAnyIncorrect && id !== 'mock-exam') ? 'Skip to Next' : 'Next Question'}</Text>
+                      <MaterialCommunityIcons name="arrow-right" size={20} color="#fff" style={{ position: 'absolute', right: 15 }} />
+                  </TouchableOpacity>
                 </View>
-              )}
+              </View>
+            )}
 
-             {/* START BUTTONS */}
-             {mode === 'IDLE' && !result && !mcResult && !dictationResult && !highlightResult && !reOrderScore && !fillBlankScore && !rwResult && !lFibResult && !isSummarizeWritten && !isSummarizeSpoken && !isWriteDictation && !isEssay && !isRespondSituation && !isSummarizeGroup && (
-                <View style={styles.idleControls}>
-                   <TouchableOpacity style={styles.btnPrimary} onPress={() => {
-                       if (isPersonalIntro) {
-                           setMode('PREP'); startTimer(25, () => startRecording(30));
-                       }
-                       else if (isASQ) startASQSequence();
-                       else if (isRetellLecture) handlePlayLecture();
-                       else if (isRepeatSentence) handlePlayAudio();
-                       else if (isReadAloud || isDescribeImage) handleStartPrep();
-                       else if (isFillBlanks) checkFillBlankAnswer();
-                       else if (isFillBlanksRW) checkRwAnswer();
-                       else if (isFillBlanksListening) checkLFibAnswer();
-                       else if (isReOrder) checkReOrderAnswer();
-                       else if (isAnyMC) {
-                           if (activeType === 'multiple-choice-l-multi' || activeType === 'multiple-choice-l-single' || isHighlightCorrectSummary || isSelectMissingWord) {
-                               startListeningMC();
-                           } else {
-                               if (selectedOptions.length > 0) submitMultipleChoice();
-                               else Alert.alert("Selection Required", "Please select at least one option.");
-                           }
-                       }
-                       else handleNext(); // For Reading tasks in mock exam
-                   }}>
-                       <Text style={styles.btnText}>
-                           {isPersonalIntro ? 'Start Introduction' : 
-                            (isReadAloud || isDescribeImage || isRepeatSentence || isRetellLecture || isASQ) ? 'Start Question' : 
-                            (isFillBlanks || isFillBlanksRW || isFillBlanksListening || isReOrder) ? 'Submit Answer' :
-                            'Next Task'}
-                       </Text>
-                   </TouchableOpacity>
-                </View>
-             )}
-
-             {/* PREP BUTTONS */}
-             {mode === 'PREP' && (
-                <View style={styles.idleControls}>
-                   <TouchableOpacity style={styles.btnSecondary} onPress={() => startRecording(40)}>
-                       <Text style={styles.btnTextDark}>Skip Prep</Text>
-                   </TouchableOpacity>
-                </View>
-             )}
-
-             {/* STOP BUTTON */}
-             {mode === 'RECORDING' && (
-                 <TouchableOpacity style={styles.btnDanger} onPress={() => stopRecording(recording)}>
-                     <Text style={styles.btnText}>Stop</Text>
+           {mode === 'IDLE' && !result && !mcResult && !dictationResult && !highlightResult && !reOrderScore && !fillBlankScore && !rwResult && !lFibResult && !isSummarizeWritten && !isSummarizeSpoken && !isWriteDictation && !isEssay && !isRespondSituation && !isSummarizeGroup && (
+              <View style={styles.idleControls}>
+                 <TouchableOpacity style={styles.btnPrimary} onPress={handleStartPress}>
+                     <Text style={styles.btnText}>
+                         {isPersonalIntro ? 'Start Introduction' : 
+                          (isReadAloud || isDescribeImage || isRepeatSentence || isRetellLecture || isASQ) ? 'Start Question' : 
+                          (isFillBlanks || isFillBlanksRW || isFillBlanksListening || isReOrder) ? 'Submit Answer' :
+                          'Next Task'}
+                     </Text>
                  </TouchableOpacity>
-             )}
-             
-             {/* SPINNER */}
-             {(mode === 'PROCESSING' || mode === 'PLAYING_AUDIO' || mode === 'PREP_RETELL') && (
-               <View style={{ alignItems: 'center', padding: 20 }}>
-                 <CustomLoader message={mode === 'PROCESSING' ? "Processing results..." : undefined} />
-               </View>
-             )}
+              </View>
+           )}
 
-          </View>
-        )}
+           {mode === 'PREP' && (
+              <View style={styles.idleControls}>
+                 <TouchableOpacity style={styles.btnSecondary} onPress={() => startRecording(40)}>
+                     <Text style={styles.btnTextDark}>Skip Prep</Text>
+                 </TouchableOpacity>
+              </View>
+           )}
 
-      {/* MODALS AND ZOOM */}
-      <Modal 
-        animationType="slide" 
-        transparent={true} 
-        visible={showModelAnswer} 
-        onRequestClose={() => setShowModelAnswer(false)}
-      >
+           {mode === 'RECORDING' && (
+               <TouchableOpacity style={styles.btnDanger} onPress={() => stopRecording(recording)}>
+                   <Text style={styles.btnText}>Stop</Text>
+               </TouchableOpacity>
+           )}
+           
+           {(mode === 'PROCESSING' || mode === 'PLAYING_AUDIO' || mode === 'PREP_RETELL') && (
+             <View style={{ alignItems: 'center', padding: 20 }}>
+               <CustomLoader message={mode === 'PROCESSING' ? "Processing results..." : undefined} />
+             </View>
+           )}
+
+        </View>
+      )}
+
+      {/* MODALS */}
+      <Modal animationType="slide" transparent={true} visible={showModelAnswer} onRequestClose={() => setShowModelAnswer(false)}>
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
             <View style={styles.modalHeader}>
@@ -3188,25 +3246,13 @@ export default function ModuleScreen() {
             <MaterialCommunityIcons name="close-circle" size={40} color="#fff" />
           </TouchableOpacity>
           {currentZoomImage && (
-            <ScrollView 
-              maximumZoomScale={5} 
-              minimumZoomScale={1} 
-              contentContainerStyle={{ flexGrow: 1, justifyContent: 'center', alignItems: 'center' }}
-              style={{ width: '100%', height: '100%' }}
-              showsHorizontalScrollIndicator={false}
-              showsVerticalScrollIndicator={false}
-            >
-              <Image 
-                source={typeof currentZoomImage === 'string' ? { uri: currentZoomImage } : currentZoomImage} 
-                style={{ width: width, height: height * 0.8 }} 
-                resizeMode="contain"
-              />
+            <ScrollView maximumZoomScale={5} minimumZoomScale={1} contentContainerStyle={{ flexGrow: 1, justifyContent: 'center', alignItems: 'center' }} style={{ width: '100%', height: '100%' }} showsHorizontalScrollIndicator={false} showsVerticalScrollIndicator={false}>
+              <Image source={typeof currentZoomImage === 'string' ? { uri: currentZoomImage } : currentZoomImage} style={{ width: width, height: height * 0.8 }} resizeMode="contain" />
             </ScrollView>
           )}
         </View>
       </Modal>
 
-      {/* ASQ RESULT MODAL */}
       <Modal visible={asqResultPopup} transparent={true} animationType="slide">
         <View style={styles.modalOverlay}>
           <View style={[styles.modalContent, { backgroundColor: result?.content && result.content >= 60 ? '#F0FDF4' : '#FEF2F2' }]}>
@@ -3241,10 +3287,7 @@ export default function ModuleScreen() {
             </View>
 
             {result?.content && result.content >= 60 ? (
-              <TouchableOpacity 
-                style={[styles.nextBtnSmall, { width: '100%', justifyContent: 'center' }]} 
-                onPress={proceedToNextASQ}
-              >
+              <TouchableOpacity style={[styles.nextBtnSmall, { width: '100%', justifyContent: 'center' }]} onPress={proceedToNextASQ}>
                 <Text style={styles.btnTextSmall}>
                   {currentIndex < questions.length - 1 ? 'Next Question' : 'Finish Session'}
                 </Text>
@@ -3253,17 +3296,11 @@ export default function ModuleScreen() {
             ) : (
             <View style={{ gap: 8, width: '100%', padding: 12, backgroundColor: result?.content && result.content >= 60 ? '#F0FDF4' : '#FEF2F2', borderTopWidth: 1, borderColor: result?.content && result.content >= 60 ? '#D1FAE5' : '#FECACA', borderRadius: 16 }}>
                 {id !== 'mock-exam' && (
-                  <TouchableOpacity 
-                    style={styles.btnPrimarySmall} 
-                    onPress={handleResetQuestion}
-                  >
+                  <TouchableOpacity style={styles.btnPrimarySmall} onPress={handleResetQuestion}>
                     <Text style={styles.btnTextSmall}>Try Again</Text>
                   </TouchableOpacity>
                 )}
-                <TouchableOpacity 
-                  style={styles.nextBtnSmall} 
-                  onPress={proceedToNextASQ}
-                >
+                <TouchableOpacity style={styles.nextBtnSmall} onPress={proceedToNextASQ}>
                   <Text style={styles.btnTextSmall}>Skip to Next</Text>
                   <MaterialCommunityIcons name="arrow-right" size={20} color="#fff" style={{ position: 'absolute', right: 15 }} />
                 </TouchableOpacity>
@@ -3273,7 +3310,6 @@ export default function ModuleScreen() {
         </View>
       </Modal>
 
-      {/* SPEAK NOW POPUP */}
       <Modal visible={showSpeakNow} transparent={true} animationType="fade">
         <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.4)' }}>
           <View style={{ backgroundColor: colors.surface, padding: 40, borderRadius: 30, alignItems: 'center', elevation: 20, borderWidth: 4, borderColor: '#10B981' }}>
@@ -3285,7 +3321,6 @@ export default function ModuleScreen() {
         </View>
       </Modal>
 
-      {/* ONE-TIME INTRODUCTORY POPUP */}
       <Modal visible={showIntroPopup} transparent={true} animationType="slide">
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
@@ -3308,71 +3343,34 @@ export default function ModuleScreen() {
         </View>
       </Modal>
 
-      {/* DROPDOWN MODAL FOR FILL IN THE BLANKS */}
-      <Modal
-        visible={activeBlankIndex !== null || activeRwBlankIndex !== null}
-        transparent={true}
-        animationType="fade"
-        onRequestClose={() => {
-          setActiveBlankIndex(null);
-          setActiveRwBlankIndex(null);
-        }}
-      >
+      <Modal visible={activeBlankIndex !== null || activeRwBlankIndex !== null} transparent={true} animationType="fade" onRequestClose={() => { setActiveBlankIndex(null); setActiveRwBlankIndex(null); }}>
         <View style={styles.modalOverlay}>
-          <TouchableWithoutFeedback 
-            onPress={() => {
-              setActiveBlankIndex(null);
-              setActiveRwBlankIndex(null);
-            }}
-          >
+          <TouchableWithoutFeedback onPress={() => { setActiveBlankIndex(null); setActiveRwBlankIndex(null); }}>
             <View style={StyleSheet.absoluteFill} />
           </TouchableWithoutFeedback>
           <View style={styles.dropdownModalContent}>
             <Text style={styles.dropdownTitle}>Select an Answer</Text>
             <ScrollView style={{ maxHeight: 300 }} nestedScrollEnabled={true}>
               {(activeBlankIndex !== null ? questions[currentIndex]?.options : questions[currentIndex]?.options)?.map((option: string, idx: number) => (
-                <TouchableOpacity 
-                  key={idx} 
-                  style={styles.dropdownItem} 
-                  onPress={() => {
-                    if (activeBlankIndex !== null) handleSelectWord(option);
-                    else if (activeRwBlankIndex !== null) handleSelectRwWord(option);
-                  }}
-                >
+                <TouchableOpacity key={idx} style={styles.dropdownItem} onPress={() => {
+                  if (activeBlankIndex !== null) handleSelectWord(option);
+                  else if (activeRwBlankIndex !== null) handleSelectRwWord(option);
+                }}>
                   <Text style={styles.dropdownItemText}>{option}</Text>
                 </TouchableOpacity>
               ))}
             </ScrollView>
-            <TouchableOpacity 
-              style={styles.dropdownCloseBtn} 
-              onPress={() => {
-                setActiveBlankIndex(null);
-                setActiveRwBlankIndex(null);
-              }}
-            >
+            <TouchableOpacity style={styles.dropdownCloseBtn} onPress={() => { setActiveBlankIndex(null); setActiveRwBlankIndex(null); }}>
               <Text style={styles.dropdownCloseText}>Cancel</Text>
             </TouchableOpacity>
           </View>
         </View>
       </Modal>
 
-      {/* Score Feedback Popup - Now at the end to ensure it's on top of other modals */}
-      <Modal
-        visible={!!scoreFeedback}
-        transparent={true}
-        animationType="fade"
-        pointerEvents="none"
-      >
+      <Modal visible={!!scoreFeedback} transparent={true} animationType="fade" pointerEvents="none">
         <View style={styles.feedbackOverlay} pointerEvents="none">
-          <View style={[
-            styles.feedbackPopup, 
-            { backgroundColor: scoreFeedback?.type === 'success' ? '#10B981' : scoreFeedback?.type === 'error' ? '#EF4444' : '#3B82F6' }
-          ]}>
-            <MaterialCommunityIcons 
-              name={scoreFeedback?.type === 'success' ? 'check-circle' : scoreFeedback?.type === 'error' ? 'alert-circle' : 'information'} 
-              size={20} 
-              color="#fff" 
-            />
+          <View style={[styles.feedbackPopup, { backgroundColor: scoreFeedback?.type === 'success' ? '#10B981' : scoreFeedback?.type === 'error' ? '#EF4444' : '#3B82F6' }]}>
+            <MaterialCommunityIcons name={scoreFeedback?.type === 'success' ? 'check-circle' : scoreFeedback?.type === 'error' ? 'alert-circle' : 'information'} size={20} color="#fff" />
             <Text style={styles.feedbackText}>{scoreFeedback?.message}</Text>
           </View>
         </View>
@@ -3380,4 +3378,4 @@ export default function ModuleScreen() {
     </SafeAreaView>
   );
 }
-// Styles moved inside component for dynamic theme support
+
