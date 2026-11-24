@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useRef, useMemo } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, Alert, Dimensions, FlatList, Image, Modal, ScrollView, TextInput, Keyboard, KeyboardAvoidingView, Platform, TouchableWithoutFeedback } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, Alert, Dimensions, FlatList, Image, Modal, ScrollView, TextInput, Keyboard, KeyboardAvoidingView, Platform, TouchableWithoutFeedback, ImageStyle } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { Audio } from 'expo-av';
 import * as Speech from 'expo-speech';
@@ -36,11 +36,17 @@ import { SUMMARIZE_GROUP_QUESTIONS } from '../../constants/summarizeGroupData';
 import { RESPOND_SITUATION_QUESTIONS } from '../../constants/respondSituationData';
 import { db, auth, ensureAuth, handleFirestoreError, OperationType } from '../../services/firebase';
 import { collection, doc, setDoc, query, orderBy, limit, getDocs, where, increment, updateDoc, onSnapshot } from 'firebase/firestore';
-import { analyzeSpeech, analyzeWriting, synthesizeSpeech } from '../../services/geminiService';
+import { analyzeSpeech, analyzeWriting, analyzeEssay, synthesizeSpeech } from '../../services/geminiService';
 import { scoreService } from '../../services/scoreService';
 import { networkService } from '../../services/networkService';
 import { Config } from '../../constants/config';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import {
+  Gesture,
+  GestureDetector,
+  GestureHandlerRootView
+} from 'react-native-gesture-handler';
+import Animated, { useSharedValue, useAnimatedStyle } from 'react-native-reanimated';
 
 const { width, height } = Dimensions.get('window');
 
@@ -254,6 +260,20 @@ const ListeningFillBlanksContent = React.memo(({ item, lFibAnswers, lFibResult, 
     prevProps.lFibAnswers.join(',') === nextProps.lFibAnswers.join(',')
   );
 });
+
+type EssayCefrLevel = 'A1' | 'A2' | 'B1' | 'B1+' | 'C1' | 'C2';
+
+const getEssayLevel = (essayId: string | number): EssayCefrLevel | null => {
+  const idNumber = Number(essayId);
+  if (!Number.isInteger(idNumber)) return null;
+  if (idNumber >= 1 && idNumber <= 25) return 'A1';
+  if (idNumber >= 26 && idNumber <= 50) return 'A2';
+  if (idNumber >= 51 && idNumber <= 90) return 'B1';
+  if (idNumber >= 91 && idNumber <= 130) return 'B1+';
+  if (idNumber >= 131 && idNumber <= 140) return 'C1';
+  if (idNumber >= 141 && idNumber <= 150) return 'C2';
+  return null;
+};
 
 export default function ModuleScreen() {
   const params = useLocalSearchParams();
@@ -563,7 +583,12 @@ export default function ModuleScreen() {
     setQuestions(loaded);
     setLoading(false);
   }, [id, startIndex, customConfig]);
-  const [currentIndex, setCurrentIndex] = useState(0);
+  const [currentIndex, setCurrentIndex] = useState(() => {
+    const requestedStartIndex = Number(startIndex);
+    return id === 'essay' && Number.isInteger(requestedStartIndex) && requestedStartIndex >= 0
+      ? requestedStartIndex
+      : 0;
+  });
   const [bestScores, setBestScores] = useState<{[key: number]: number}>({});
   const [scoreFeedback, setScoreFeedback] = useState<{message: string, type: 'success' | 'info' | 'error'} | null>(null);
 
@@ -618,16 +643,82 @@ export default function ModuleScreen() {
   const [isImageViewVisible, setIsImageViewVisible] = useState(false);
   const [currentZoomImage, setCurrentZoomImage] = useState<any>(null);
 
+  // Image pinch-to-zoom controls
+const zoomScale = useSharedValue(1);
+const savedScale = useSharedValue(1);
+
+const translateX = useSharedValue(0);
+const translateY = useSharedValue(0);
+const savedTranslateX = useSharedValue(0);
+const savedTranslateY = useSharedValue(0);
+
+const resetImageZoom = () => {
+  zoomScale.value = 1;
+  savedScale.value = 1;
+  translateX.value = 0;
+  translateY.value = 0;
+  savedTranslateX.value = 0;
+  savedTranslateY.value = 0;
+};
+
+const pinchGesture = Gesture.Pinch()
+  .onUpdate((event) => {
+    zoomScale.value = Math.max(
+      1,
+      Math.min(savedScale.value * event.scale, 5)
+    );
+  })
+  .onEnd(() => {
+    savedScale.value = zoomScale.value;
+  });
+
+const panGesture = Gesture.Pan()
+  .onUpdate((event) => {
+    if (zoomScale.value > 1) {
+      translateX.value = savedTranslateX.value + event.translationX;
+      translateY.value = savedTranslateY.value + event.translationY;
+    }
+  })
+  .onEnd(() => {
+    savedTranslateX.value = translateX.value;
+    savedTranslateY.value = translateY.value;
+  });
+
+const imageGesture = Gesture.Simultaneous(
+  pinchGesture,
+  panGesture
+);
+
+const animatedImageStyle = useAnimatedStyle<ImageStyle>(() => ({
+  transform: [
+    { translateX: translateX.value },
+    { translateY: translateY.value },
+    { scale: zoomScale.value },
+  ] as ImageStyle['transform'],
+}));
+
   const [voiceId, setVoiceId] = useState<string | null>(null);
   const [isVoiceReady, setIsVoiceReady] = useState(false);
   const [isGeneratingTTS, setIsGeneratingTTS] = useState(false);
   const [scoredQuestions, setScoredQuestions] = useState<Record<number, number>>({});
   const flatListRef = useRef<FlatList>(null);
+  const progressScrollRef = useRef<ScrollView>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const timeLeftRef = useRef<number>(0);
   const totalTimeRef = useRef<number>(0);
   const autoNextTimerRef = useRef<NodeJS.Timeout | null>(null);
   const handleLFibChange = React.useCallback((text: string, index: number) => { setLFibAnswers(prev => { const newAnswers = [...prev]; newAnswers[index] = text; return newAnswers; }); }, []);
+
+  // Keep the active question visible in the horizontal section progress bar.
+  useEffect(() => {
+    if (id === 'essay') {
+      progressScrollRef.current?.scrollTo({
+        x: Math.max(0, currentIndex * 46 - 100),
+        animated: true,
+      });
+    }
+  }, [id, currentIndex]);
+
   useEffect(() => {
     if (id && id !== 'mock-exam' && moduleInfo && questions.length > 0) {
       const hasAnsweredCurrent = scoredQuestions[currentIndex] !== undefined || mode === 'RESULT';
@@ -1417,7 +1508,7 @@ const FeedbackRow = ({label, text, isIncorrect}: {label: string, text: string, i
               return;
           }
 
-          const res = await analyzeSpeech(uri, ctx, moduleInfo?.title || "", isDescribeImage ? q.image : undefined); 
+          const res = await analyzeSpeech(uri, ctx, moduleInfo?.title || "", isDescribeImage ? q.image : undefined, isReadAloud); 
 
           if (!res) throw new Error("AI Analysis returned no result");
 
@@ -1484,7 +1575,7 @@ const FeedbackRow = ({label, text, isIncorrect}: {label: string, text: string, i
     if (isASQ) ctx = `Question: ${q.text}. Expected Answer: ${q.answer}`;
     if (isRespondSituation) ctx = `Situation: ${q.situation}. Task: ${q.task}`;
 
-    const res = await analyzeSpeech(lastRecordingUri, ctx, moduleInfo?.title || "PTE Practice"); 
+    const res = await analyzeSpeech(lastRecordingUri, ctx, moduleInfo?.title || "PTE Practice", undefined, isReadAloud); 
     
     if (!res) throw new Error("AI returned empty result");
 
@@ -1603,7 +1694,11 @@ const FeedbackRow = ({label, text, isIncorrect}: {label: string, text: string, i
     setMode('PROCESSING');
     try {
       const q = questions[currentIndex];
-      const res = await analyzeWriting(userSummary, q.topic, "Essay");
+      const essayLevel = getEssayLevel(q.id);
+      if (!essayLevel) {
+        throw new Error(`Unable to determine the CEFR level for essay ID: ${q.id}`);
+      }
+      const res = await analyzeEssay(userSummary, q.topic, essayLevel);
       
       if (res.breakdown) {
         await scoreService.updatePerformance({
@@ -1955,7 +2050,13 @@ const FeedbackRow = ({label, text, isIncorrect}: {label: string, text: string, i
                   </Text>
               </View>
             )}
-            <TouchableOpacity onPress={() => { if(item.image) { setCurrentZoomImage(item.image); setIsImageViewVisible(true); } }} activeOpacity={0.8} style={{width:'100%', alignItems:'center'}}>
+            <TouchableOpacity onPress={() => {
+              if (item.image) {
+                resetImageZoom();
+                setCurrentZoomImage(item.image);
+                setIsImageViewVisible(true);
+              }
+            }} activeOpacity={0.8} style={{width:'100%', alignItems:'center'}}>
               {item.image ? ( <Image source={{ uri: item.image }} style={[styles.chartImage, { height: 220 }]} resizeMode="contain" /> ) : ( 
                 <View style={styles.missingImage}><MaterialCommunityIcons name="image-off" size={40} color="#ccc" /><Text>Image Missing</Text></View> 
               )}
@@ -2284,7 +2385,12 @@ const FeedbackRow = ({label, text, isIncorrect}: {label: string, text: string, i
                 <View style={{marginBottom: 20}}><Text style={{fontSize:18, fontWeight:'bold', color: colors.text, marginBottom: 5}}>Topic:</Text><Text style={{fontSize:18, lineHeight:28, color: colors.text}}>{item.topic}</Text></View>
                 <Text style={styles.areaLabel}>Your Response:</Text>
                 <TextInput style={{ backgroundColor: colors.surface, borderWidth: 1, borderColor: colors.border, borderRadius: 12, padding: 15, fontSize: 16, lineHeight: 24, textAlignVertical: 'top', minHeight: 300, marginBottom: 10, color: colors.text }} multiline placeholder="Type your essay here..." value={userSummary} onChangeText={(text) => { setUserSummary(text); setWordCount(text.trim().split(/\s+/).filter(w => w.length > 0).length); }} editable={mode !== 'RESULT'} />
-                <View style={{flexDirection: 'row', justifyContent: 'space-between', marginBottom: 20}}><Text style={{color: colors.subtext}}>Target: 200-300 words</Text><Text style={{fontWeight: 'bold', color: (wordCount >= 200 && wordCount <= 300) ? '#10B981' : '#EF4444'}}>Word Count: {wordCount}</Text></View>
+                {getEssayLevel(item.id) !== 'A1' && getEssayLevel(item.id) !== 'A2' && (
+                  <View style={{flexDirection: 'row', justifyContent: 'space-between', marginBottom: 20}}>
+                    <Text style={{color: colors.subtext}}>Target: 200-300 words</Text>
+                    <Text style={{fontWeight: 'bold', color: (wordCount >= 200 && wordCount <= 300) ? '#10B981' : '#EF4444'}}>Word Count: {wordCount}</Text>
+                  </View>
+                )}
                 {mode === 'IDLE' && ( <TouchableOpacity style={styles.btnPrimary} onPress={() => { handleEssaySubmit(); }}><Text style={styles.btnText}>Submit Essay</Text></TouchableOpacity> )}
              </ScrollView>
           </View>
@@ -2648,7 +2754,11 @@ const FeedbackRow = ({label, text, isIncorrect}: {label: string, text: string, i
                 ]}
                 onPress={() => {
                   if (!isLocked) {
-                    router.push(`/module/${task.id}`);
+                    if (task.id === 'essay') {
+                      router.push('/module/essay-intro' as any);
+                    } else {
+                      router.push(`/module/${task.id}`);
+                    }
                   } else {
                     Alert.alert("Locked", "This task is currently locked by your teacher.");
                   }
@@ -2760,7 +2870,20 @@ const FeedbackRow = ({label, text, isIncorrect}: {label: string, text: string, i
       {!isKeyboardVisible && (
         <View style={styles.jumpToContainer}>
           <Text style={styles.jumpToLabel}>SECTION PROGRESS:</Text>
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.jumpToScroll}>
+          <ScrollView
+            ref={progressScrollRef}
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={styles.jumpToScroll}
+            onContentSizeChange={() => {
+              if (id === 'essay') {
+                progressScrollRef.current?.scrollTo({
+                  x: Math.max(0, currentIndex * 46 - 100),
+                  animated: false,
+                });
+              }
+            }}
+          >
             {questions.map((_, index) => {
               const itemScored = scoredQuestions[index] !== undefined;
               const isCurrent = currentIndex === index;
@@ -2815,9 +2938,34 @@ const FeedbackRow = ({label, text, isIncorrect}: {label: string, text: string, i
                         </Text>
                     </View>
                     
+                                        {isDescribeImage && typeof result.userTranscript === 'string' && result.userTranscript.trim().length > 0 && (
+                      <View style={{
+                        backgroundColor: isDark ? colors.border : '#EFF6FF',
+                        padding: 12,
+                        borderRadius: 8,
+                        marginBottom: 15,
+                        borderWidth: 1,
+                        borderColor: isDark ? colors.border : '#BFDBFE'
+                      }}>
+                        <Text style={{
+                          fontWeight: 'bold',
+                          color: isDark ? colors.text : '#1E40AF',
+                          marginBottom: 6
+                        }}>
+                          What We Heard (AI Transcript)
+                        </Text>
+                        <Text style={{
+                          color: colors.text,
+                          fontSize: 14,
+                          lineHeight: 22
+                        }}>
+                          {result.userTranscript}
+                        </Text>
+                      </View>
+                    )}
+
                     <View style={{marginBottom: 15}}>
                         {result.breakdown && Object.entries(result.breakdown).map(([k,v]:any) => {
-                           if (k.toLowerCase() === 'pronunciation' && result.overall < 50) return null;
                            return <FeedbackRow key={k} label={k.toUpperCase()} text={v.toString()} isIncorrect={result.overall < 50} />;
                         })}
                     </View>
@@ -2832,21 +2980,34 @@ const FeedbackRow = ({label, text, isIncorrect}: {label: string, text: string, i
                         <Text style={{ fontSize: 10, color: '#94A3B8', fontWeight: 'bold' }}>SCROLL FOR MORE FEEDBACK</Text>
                     </View>
 
+                    {isReadAloud && result.contentProvisional && (
+                      <View style={{backgroundColor: isDark ? '#422006' : '#FFFBEB', padding: 12, borderRadius: 8, marginBottom: 15, borderWidth: 1, borderColor: '#F59E0B'}}>
+                          <View style={{flexDirection: 'row', alignItems: 'center', marginBottom: 5}}>
+                              <MaterialCommunityIcons name="alert-circle-outline" size={18} color={isDark ? '#FBBF24' : '#B45309'} style={{marginRight: 6}} />
+                              <Text style={{fontWeight: 'bold', color: isDark ? '#FDE68A' : '#92400E'}}>Provisional Content Score — Review Needed</Text>
+                          </View>
+                          <Text style={{color: isDark ? '#FDE68A' : '#92400E', fontSize: 13, lineHeight: 19}}>
+                              {result.contentCalculation?.uncertainTargetWords ?? 0} word(s) could not be identified reliably and were excluded from the Content calculation. The score may change after reviewing the recording.
+                          </Text>
+                      </View>
+                    )}
+
                     {result.wordAnalysis && result.wordAnalysis.length > 0 && (
                       <View style={{backgroundColor: isDark ? colors.border : '#F1F5F9', padding: 10, borderRadius: 8, marginBottom: 15, borderWidth: 1, borderColor: isDark ? colors.border : '#E2E8F0'}}>
                           <Text style={{fontWeight: 'bold', color: colors.text, marginBottom: 5}}>Pronunciation Heatmap (Tap word to listen):</Text>
                           <View style={{flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center'}}>
                               {result.wordAnalysis.map((item: any, i: number) => {
                                   const isBad = item.health === 'bad';
+                                  const isUncertain = item.health === 'uncertain';
                                   return (
-                                      <TouchableOpacity 
-                                        key={i} 
+                                      <TouchableOpacity
+                                        key={i}
                                         onPress={() => playHeatmapWord(item.word)}
-                                        style={{ margin: 2, paddingHorizontal: 4, paddingVertical: 2, borderRadius: 4, backgroundColor: isBad ? '#FECACA' : 'transparent' }}
+                                        style={{ margin: 2, paddingHorizontal: 4, paddingVertical: 2, borderRadius: 4, backgroundColor: isBad ? '#FECACA' : isUncertain ? (isDark ? '#78350F' : '#FEF3C7') : 'transparent' }}
                                       >
-                                        <Text style={{ 
-                                          fontSize: 16, 
-                                          color: isBad ? '#991B1B' : '#059669',
+                                        <Text style={{
+                                          fontSize: 16,
+                                          color: isBad ? '#991B1B' : isUncertain ? (isDark ? '#FDE68A' : '#92400E') : '#059669',
                                           textDecorationLine: isBad ? 'underline' : 'none'
                                         }}>
                                           {item.word}
@@ -2855,8 +3016,14 @@ const FeedbackRow = ({label, text, isIncorrect}: {label: string, text: string, i
                                   );
                               })}
                           </View>
-                          
-                          <TouchableOpacity 
+                          {result.wordAnalysis.some((w: any) => w.health === 'uncertain') && (
+                            <View style={{flexDirection: 'row', alignItems: 'center', marginTop: 8}}>
+                              <View style={{width: 9, height: 9, borderRadius: 5, backgroundColor: '#F59E0B', marginRight: 6}} />
+                              <Text style={{fontSize: 12, color: isDark ? '#FDE68A' : '#92400E'}}>Amber = uncertain word; not counted as a Content error</Text>
+                            </View>
+                          )}
+
+                          <TouchableOpacity
                             onPress={() => {
                                 const targetText = currentItem.transcript || currentItem.text || currentItem.situation || currentItem.title || "";
                                 playFullAITranscript(targetText);
@@ -2868,7 +3035,6 @@ const FeedbackRow = ({label, text, isIncorrect}: {label: string, text: string, i
                               {isGeneratingTTS ? 'Generating Perfect AI Audio...' : 'Play Perfect AI Pronunciation'}
                             </Text>
                           </TouchableOpacity>
-                          
                       </View>
                     )}
 
@@ -2881,6 +3047,21 @@ const FeedbackRow = ({label, text, isIncorrect}: {label: string, text: string, i
                                   <View style={{flex: 1}}>
                                       <Text style={{color: '#7F1D1D', fontWeight: 'bold', fontSize: 15}}>{item.word}</Text>
                                       {item.label && <Text style={{color: '#991B1B', fontSize: 13, marginTop: 2}}>{item.label}</Text>}
+                                  </View>
+                              </TouchableOpacity>
+                          ))}
+                      </View>
+                    )}
+
+                    {isReadAloud && result?.wordAnalysis && result.wordAnalysis.some((w: any) => w.health === 'uncertain') && (
+                      <View style={{backgroundColor: isDark ? '#422006' : '#FFFBEB', padding: 12, borderRadius: 8, marginBottom: 15, borderWidth: 1, borderColor: '#F59E0B'}}>
+                          <Text style={{fontWeight: 'bold', color: isDark ? '#FDE68A' : '#92400E', marginBottom: 8}}>Words Needing Review:</Text>
+                          {result.wordAnalysis.filter((w: any) => w.health === 'uncertain').map((item: any, idx: number) => (
+                              <TouchableOpacity key={`uncertain-${idx}`} style={{flexDirection: 'row', alignItems: 'flex-start', marginBottom: 6}} onPress={() => playHeatmapWord(item.word)}>
+                                  <MaterialCommunityIcons name="help-circle-outline" size={16} color="#D97706" style={{marginRight: 6, marginTop: 2}} />
+                                  <View style={{flex: 1}}>
+                                      <Text style={{color: isDark ? '#FDE68A' : '#92400E', fontWeight: 'bold', fontSize: 15}}>{item.word}</Text>
+                                      {item.label && <Text style={{color: isDark ? '#FDE68A' : '#92400E', fontSize: 13, marginTop: 2}}>{item.label}</Text>}
                                   </View>
                               </TouchableOpacity>
                           ))}
@@ -3240,17 +3421,63 @@ const FeedbackRow = ({label, text, isIncorrect}: {label: string, text: string, i
           </View>
         </View>
       </Modal>
-      <Modal visible={isImageViewVisible} transparent={true} animationType="fade" onRequestClose={() => setIsImageViewVisible(false)}>
-        <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.9)', justifyContent: 'center', alignItems: 'center' }}>
-          <TouchableOpacity style={{ position: 'absolute', top: 40, right: 20, zIndex: 10, padding: 10 }} onPress={() => setIsImageViewVisible(false)}>
-            <MaterialCommunityIcons name="close-circle" size={40} color="#fff" />
+      <Modal
+        visible={isImageViewVisible}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => {
+          resetImageZoom();
+          setIsImageViewVisible(false);
+        }}
+      >
+        <GestureHandlerRootView style={{ flex: 1 }}>
+          <View style={{
+            flex: 1,
+            backgroundColor: 'rgba(0,0,0,0.9)',
+            justifyContent: 'center',
+            alignItems: 'center'
+          }}>
+          <TouchableOpacity
+            style={{
+              position: 'absolute',
+              top: 40,
+              right: 20,
+              zIndex: 10,
+              padding: 10
+            }}
+            onPress={() => {
+              resetImageZoom();
+              setIsImageViewVisible(false);
+            }}
+          >
+            <MaterialCommunityIcons
+              name="close-circle"
+              size={40}
+              color="#fff"
+            />
           </TouchableOpacity>
+
           {currentZoomImage && (
-            <ScrollView maximumZoomScale={5} minimumZoomScale={1} contentContainerStyle={{ flexGrow: 1, justifyContent: 'center', alignItems: 'center' }} style={{ width: '100%', height: '100%' }} showsHorizontalScrollIndicator={false} showsVerticalScrollIndicator={false}>
-              <Image source={typeof currentZoomImage === 'string' ? { uri: currentZoomImage } : currentZoomImage} style={{ width: width, height: height * 0.8 }} resizeMode="contain" />
-            </ScrollView>
+            <GestureDetector gesture={imageGesture}>
+              <Animated.Image
+                source={
+                  typeof currentZoomImage === 'string'
+                    ? { uri: currentZoomImage }
+                    : currentZoomImage
+                }
+                style={[
+                  {
+                    width: width,
+                    height: height * 0.8
+                  },
+                  animatedImageStyle
+                ]}
+                resizeMode="contain"
+              />
+            </GestureDetector>
           )}
         </View>
+        </GestureHandlerRootView>
       </Modal>
 
       <Modal visible={asqResultPopup} transparent={true} animationType="slide">

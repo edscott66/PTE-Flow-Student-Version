@@ -1,9 +1,11 @@
+
 import { Stack, useRouter, useSegments, useRootNavigationState } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import React, { useEffect, useState } from 'react';
+import { View, ActivityIndicator } from 'react-native';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { db, auth, ensureAuth } from '../services/firebase';
 import { scoreService } from '../services/scoreService';
-import { View, ActivityIndicator } from 'react-native';
 import { ThemeProvider, useTheme } from '../context/ThemeContext';
 
 function RootLayoutContent() {
@@ -81,8 +83,10 @@ function RootLayoutContent() {
 
 export default function RootLayout() {
   return (
-    <ThemeProvider>
-      <RootLayoutContent />
-    </ThemeProvider>
+    <GestureHandlerRootView style={{ flex: 1 }}>
+      <ThemeProvider>
+        <RootLayoutContent />
+      </ThemeProvider>
+    </GestureHandlerRootView>
   );
 }

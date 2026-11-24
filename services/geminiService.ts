@@ -28,7 +28,10 @@ const getAI = () => {
  * Analyze speech for PTE tasks.
  * Uses Gemini as the primary engine for high-quality coaching and scoring.
  */
-export const analyzeSpeech = async (audioUri: string, questionText: string, questionType: string, imageUri?: string) => {
+export const analyzeSpeech = async (audioUri: string, questionText: string, questionType: string, imageUri?: string, isReadAloudTask = false) => {
+  // The Read Aloud-specific scoring path will use this flag in the next step.
+  void isReadAloudTask;
+
   try {
     if (!audioUri) throw new Error("No audio URI provided");
 
@@ -59,20 +62,163 @@ export const analyzeSpeech = async (audioUri: string, questionText: string, ques
       }
     }
 
-    const prompt = `
-      Act as a strict professional PTE Academic examiner and coach. 
+    const isDescribeImageTask = /describe\s*image/i.test(questionType);
+    const isAnswerShortQuestionTask = /answer\s*short\s*question|\bASQ\b/i.test(questionType);
+
+const prompt = isDescribeImageTask
+  ? `
+      Act as a strict professional PTE Academic examiner and coach.
+
+      Task Type: Describe Image
+
+      The student has been given an image to describe.
+      Evaluate the student's spoken description against the ACTUAL IMAGE provided.
+      The image title or topic is only a reference. It is NOT a script that the student
+      is expected to repeat.
+
+      Analyze the audio using PTE Academic Speaking standards (0-90 scoring).
+
+      CRITICAL RULE:
+      If the audio is silent, contains only background noise, or no recognizable
+      speech is present, set all scores to 0 and userTranscript to
+      "[No speech detected]". Explain that no speech was heard.
+
+      EVALUATION:
+
+      1. Transcribe the student's actual spoken words accurately.
+      2. Content (0-90):
+         - Evaluate whether the student identifies and describes the important
+           information visible in the image.
+         - Consider relevant features, trends, comparisons, proportions,
+           relationships, and key details where applicable.
+         - Reward accurate, relevant observations and clear overall coverage.
+         - Do not penalize the student for using different vocabulary from the
+           image title or for describing the information in their own words.
+         - Do not invent information that is not visible in the image.
+      3. Oral Fluency (0-90):
+         - Evaluate pace, rhythm, continuity, hesitations, pauses and self-corrections.
+      4. Pronunciation (0-90):
+         - Evaluate clarity, intelligibility, word stress, and vowel and consonant
+           accuracy.
+      5. Overall Score (0-90):
+         - Provide a fair overall assessment based on the three scoring areas.
+
+      FEEDBACK:
+
+      - Summary feedback: 3-4 sentences in clear, professional English.
+      - Explain how the performance compares with the PTE high-score target (79+).
+      - Provide detailed section feedback for pronunciation, fluency and content.
+      - Give specific, practical advice based on what the student actually said.
+      - Do not claim the student omitted or mispronounced words from the image title.
+      - Do not invent errors or details that cannot be established from the audio
+        and image.
+
+      WORD-LEVEL ANALYSIS:
+
+      Describe Image has no fixed target script. The student is free to use their
+      own words and sentence structure.
+      Therefore, do NOT compare the transcript with the image title or create a
+      word-by-word target-text heatmap.
+      Return an empty wordAnalysis array.
+
+      Return a JSON object with:
+      - userTranscript (string)
+      - pronunciation (number)
+      - fluency (number)
+      - content (number)
+      - overall (number)
+      - feedback (string)
+      - sectionFeedback (object with pronunciation, fluency, content)
+      - breakdown (object with pronunciation, fluency, content)
+      - wordAnalysis (empty array)
+    `
+  : isAnswerShortQuestionTask
+    ? `
+      Act as a fair and accurate PTE Academic Answer Short Question (ASQ) examiner.
+
+      TASK:
+      The student hears one short factual question and gives a brief spoken answer.
+      Question and expected model answer:
+      "${questionText}"
+
+      IMPORTANT ASQ MARKING PRINCIPLES:
+
+      1. Judge the meaning and factual correctness of the student's spoken answer,
+         not whether it exactly matches the expected model answer.
+      2. The expected answer is a recommended model answer, not the only acceptable
+         wording. Award full content credit when the student's answer gives the
+         correct fact or meaning, even if it uses different words or a reasonable
+         alternative expression.
+      3. Accept concise, natural spoken alternatives, synonyms, equivalent names,
+         and other answers that are factually correct in the context of the question.
+      4. Do not require the student to repeat the model answer word for word.
+      5. Do not penalize spelling, capitalization, punctuation, grammar, or minor
+         speech-recognition transcription errors when the intended correct answer
+         is clear from the audio.
+      6. Do not treat a plausible but factually incorrect answer as correct.
+         Do not award content credit for an unrelated answer, a contradiction,
+         or an answer that does not answer the question.
+      7. If the response contains the correct answer together with unnecessary
+         extra words, do not penalize it unless the extra words change or contradict
+         the meaning.
+      8. If only part of the answer is correct, award partial content credit only
+         when the question genuinely allows a partially correct response.
+      9. If the audio is silent, contains only background noise, or has no
+         recognizable spoken answer, set all scores to 0 and set userTranscript
+         to "[No speech detected]".
+
+      SCORING (0-90):
+      - Content: Score the factual correctness of the answer. A clearly correct
+        answer or an accepted equivalent receives full content credit (90).
+        An incorrect, unrelated, or missing answer receives 0. Use partial marks
+        only where a response is genuinely partly correct.
+      - Pronunciation: Assess whether the spoken answer is intelligible. Do not
+        confuse a transcription error with a pronunciation error.
+      - Oral Fluency: Assess the delivery fairly, taking into account that ASQ
+        expects a short answer and does not require a long sentence.
+      - Overall: Provide a fair assessment. Content correctness is the primary
+        purpose of this task; do not reduce content marks because of accent,
+        minor pronunciation differences, or a different but correct wording.
+
+      FEEDBACK:
+      - Use clear, brief, encouraging English.
+      - State whether the answer is correct, partly correct, or incorrect.
+      - If correct, acknowledge the meaning even when the wording differs from
+        the model answer.
+      - If incorrect, briefly explain the correct fact.
+      - Never claim that an answer is wrong solely because it differs from the
+        expected model answer.
+      - Do not invent details that are not supported by the question or audio.
+
+      WORD-LEVEL ANALYSIS:
+      ASQ is assessed by the meaning and correctness of a short answer, not by
+      matching every word in a target sentence. Return an empty wordAnalysis array.
+
+      Return a JSON object with:
+      - userTranscript (string)
+      - pronunciation (number, 0-90)
+      - fluency (number, 0-90)
+      - content (number, 0-90)
+      - overall (number, 0-90)
+      - feedback (string)
+      - sectionFeedback (object with pronunciation, fluency, content strings)
+      - breakdown (object with pronunciation, fluency, content numbers)
+      - wordAnalysis (empty array)
+    `
+  : `
+      Act as a strict professional PTE Academic examiner and coach.
       Task Type: ${questionType}
       Target Sentence/Text/Topic: "${questionText}"
       ${imageUri ? "An image is provided that the user is describing." : ""}
-      
+
       Analyze the provided audio for PTE Academic standards (0-90 scoring).
-      
+
       CRITICAL RULE:
       If the audio is silent, contains only background noise, or no recognizable speech is present, you MUST:
       - Set overall, pronunciation, fluency, and content scores to 0.
       - Set userTranscript to "[No speech detected]".
       - Provide feedback explaining that no speech was heard.
-      
+
       Your Task:
       1. Transcribe what the user said as accurately as possible.
       2. Provide a score (0-90) for:
@@ -82,27 +228,26 @@ export const analyzeSpeech = async (audioUri: string, questionText: string, ques
       3. Provide an Overall Score (0-90).
       4. Provide "Plain English" Feedback with PTE References:
          - Summary Feedback (3-4 sentences): A warm, professional overview. Explicitly mention how the performance aligns with PTE expectations for a high score (79+).
-         - Section Feedback: Detailed coaching for Pronunciation, Fluency, and Content. 
+         - Section Feedback: Detailed coaching for Pronunciation, Fluency, and Content.
            * IMPORTANT: Each section MUST explicitly refer to the PTE Academic scoring criteria.
-           * Explain exactly WHAT the user needs to do to achieve a high score (e.g., "To get a 90 in Oral Fluency, you must maintain a consistent pace without self-corrections or hesitations, as per PTE standards").
-           * Use simple, actionable language for the "How to fix" part (e.g., "You stressed the second syllable of 'Photograph', try PHO-to-graph").
+           * Explain exactly WHAT the user needs to do to achieve a high score.
+           * Use simple, actionable language for the "How to fix" part.
       9. Word-Level Analysis (The Heatmap):
-         - Provide an array called "wordAnalysis" mapping EVERY word from the Target Text to how the user pronounced it. 
+         - Provide an array called "wordAnalysis" mapping EVERY word from the Target Text to how the user pronounced it.
          - For each word, provide:
-           * "word": The CORRECT dictionary spelling of the target word from the text. NEVER use phonetic or misspelled versions (e.g., write "species", never "spakies"). If the user added an extra word not in the text, spell it correctly in standard English.
+           * "word": The CORRECT dictionary spelling of the target word from the text.
            * "health": "good" (pronounced correctly), "bad" (mispronounced, garbled, or skipped).
-           * "label": optional explanation if bad (e.g., "Omitted", "Mispronounced as 'spakies'").
-      
+           * "label": optional explanation if bad.
+
       Return the result as a JSON object with:
       - userTranscript (string)
       - pronunciation (number)
       - fluency (number)
-      - content (number)
       - overall (number)
       - feedback (string, summary)
-      - sectionFeedback (object with keys: pronunciation, fluency, content. Each value is a detailed coaching string)
+      - sectionFeedback (object with keys: pronunciation, fluency, content)
       - breakdown (object with keys: pronunciation, fluency, content)
-      - wordAnalysis (array of objects with keys: word, health ('good'|'bad'), label (optional))
+      - wordAnalysis (array of objects with keys: word, health, label)
     `;
 
     const ai = getAI();
@@ -256,6 +401,202 @@ export const synthesizeSpeech = async (text: string): Promise<string | null> => 
     }
 };
 
+
+/**
+ * Analyze a PTE Academic essay using writing-only assessment criteria.
+ * This function is deliberately separate from analyzeWriting and analyzeSpeech.
+ */
+export const analyzeEssay = async (
+  essay: string,
+  essayTopic: string,
+  level: 'A1' | 'A2' | 'B1' | 'B1+' | 'C1' | 'C2'
+) => {
+  try {
+    const isBeginnerLevel = level === 'A1' || level === 'A2';
+    const levelGuidance = isBeginnerLevel
+      ? `
+      LEARNER LEVEL: ${level}
+      Assess this as a beginner English learner, not as a PTE Academic candidate.
+      Use kind, encouraging and simple English. Focus on whether the student communicates
+      the main meaning at their current level. Accept short, simple sentences and basic
+      vocabulary as appropriate. Do not expect a formal essay structure, advanced vocabulary,
+      complex grammar or a long response. Do not compare the student with PTE high-score
+      standards. Do not penalise the student for not writing 200-300 words.
+      Give practical feedback with only a few clear improvements the student can try next.
+      The 0-90 scores are learning-progress indicators for this app, not official PTE scores.
+      Create a short, clear model answer using language suitable for ${level}.
+      `
+      : `
+      LEARNER LEVEL: ${level}
+      Assess the response using the existing PTE Academic-style writing standards.
+      Keep the assessment fair for this level while retaining the PTE-style criteria and
+      0-90 scoring. Give clear, practical feedback in plain English. Do not claim that the
+      score is an official Pearson result. Aim for a 200-300 word model essay.
+      `;
+
+    const prompt = `
+      ${isBeginnerLevel
+        ? 'Act as a kind, supportive English writing teacher for a beginner learner.'
+        : 'Act as a strict, fair and professional PTE Academic Writing examiner and coach.'}
+
+      TASK TYPE: WRITE ESSAY
+      ${levelGuidance}
+
+      ESSAY QUESTION:
+      "${essayTopic}"
+
+      STUDENT'S ESSAY:
+      "${essay}"
+
+      Evaluate ONLY the student's written essay. This is a writing task, not a speaking task.
+      Do not assess or mention pronunciation, oral fluency, speaking pace, audio, voice,
+      accent, hesitation or spoken delivery.
+
+      Score each assessment area from 0 to 90, using expectations appropriate to ${level}:
+
+      1. CONTENT:
+         - Does the response answer the question and communicate relevant ideas?
+         - For A1/A2, reward clear basic meaning and relevant simple details.
+         - For B1 and above, assess development, explanation and support of ideas.
+
+      2. FORM:
+         - For A1/A2, do not require a formal essay format or a 200-300 word response.
+         - For B1 and above, assess task fulfilment and use the 200-300 word target,
+           applying a proportionate penalty only for substantially short or long responses.
+
+      3. GRAMMAR:
+         - Assess accuracy at the learner's level.
+         - For A1/A2, focus on basic sentence construction and errors that affect meaning.
+         - For B1 and above, assess a wider range of grammar and sentence control.
+
+      4. VOCABULARY:
+         - Assess appropriate vocabulary for the learner's level.
+         - Do not expect advanced or sophisticated vocabulary from A1/A2 learners.
+         - Reward accurate, natural word choice rather than unnecessary complexity.
+
+      5. SPELLING:
+         - Assess spelling fairly for the learner's level. Do not invent errors.
+
+      6. STRUCTURE:
+         - For A1/A2, accept a simple sequence of understandable sentences; do not require
+           a formal introduction, body paragraphs and conclusion.
+         - For B1 and above, assess paragraphing, progression, cohesion and conclusion.
+
+      7. LINGUISTIC RANGE:
+         - Assess the range and flexibility expected at ${level}.
+         - For A1/A2, basic vocabulary and simple sentence patterns can receive good marks
+           when they are used accurately and communicate the message.
+         - For B1 and above, assess variation and control of sentence structures.
+
+      OVERALL SCORE:
+      - Give a fair overall score from 0 to 90 based on the complete written response.
+      - Apply expectations appropriate to ${level}; do not use one standard for every level.
+      - Do not allow sophisticated vocabulary to hide irrelevant content or weak organisation.
+      - Do not allow a few minor errors to outweigh an otherwise effective response.
+      - Scores in each breakdown category must also be from 0 to 90.
+
+      FEEDBACK:
+      - Provide clear and encouraging feedback in plain English.
+      - Explain the main strengths and the most important areas to improve.
+      - Give specific advice suitable for ${level}.
+      - For A1/A2, keep the summary and section feedback short, simple and supportive.
+      - Each sectionFeedback item must discuss only its corresponding writing criterion.
+      - Never include speaking-related feedback.
+
+      MODEL ANSWER:
+      - Provide a correct sample answer to the exact question, suitable for ${level}.
+      - For A1/A2, use short sentences and common vocabulary. Keep it concise and achievable.
+      - For B1 and above, provide a developed essay of approximately 200-300 words.
+      - Do not claim that the sample is the only acceptable answer.
+
+      Return ONLY a valid JSON object with this exact structure:
+      {
+        "overall": number,
+        "feedback": string,
+        "modelAnswer": string,
+        "sectionFeedback": {
+          "content": string,
+          "grammar": string,
+          "vocabulary": string,
+          "spelling": string,
+          "structure": string,
+          "form": string,
+          "linguisticRange": string
+        },
+        "breakdown": {
+          "grammar": number,
+          "vocabulary": number,
+          "spelling": number,
+          "content": number,
+          "structure": number,
+          "form": number,
+          "linguistic": number
+        }
+      }
+    `;
+
+    const ai = getAI();
+    const response = await ai.models.generateContent({
+      model: "gemini-3.8-flash",
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+        maxOutputTokens: 8000,
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            overall: { type: Type.NUMBER },
+            feedback: { type: Type.STRING },
+            modelAnswer: { type: Type.STRING },
+            sectionFeedback: {
+              type: Type.OBJECT,
+              properties: {
+                content: { type: Type.STRING },
+                grammar: { type: Type.STRING },
+                vocabulary: { type: Type.STRING },
+                spelling: { type: Type.STRING },
+                structure: { type: Type.STRING },
+                form: { type: Type.STRING },
+                linguisticRange: { type: Type.STRING }
+              },
+              required: ["content", "grammar", "vocabulary", "spelling", "structure", "form", "linguisticRange"]
+            },
+            breakdown: {
+              type: Type.OBJECT,
+              properties: {
+                grammar: { type: Type.NUMBER },
+                vocabulary: { type: Type.NUMBER },
+                spelling: { type: Type.NUMBER },
+                content: { type: Type.NUMBER },
+                structure: { type: Type.NUMBER },
+                form: { type: Type.NUMBER },
+                linguistic: { type: Type.NUMBER }
+              },
+              required: ["grammar", "vocabulary", "spelling", "content", "structure", "form", "linguistic"]
+            }
+          },
+          required: ["overall", "feedback", "sectionFeedback", "breakdown", "modelAnswer"]
+        }
+      }
+    });
+
+    let rawText = response.text || "{}";
+    rawText = rawText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+    const res = JSON.parse(rawText);
+
+    return {
+      overall: res.overall || 0,
+      feedback: res.feedback || "Essay analysis complete.",
+      modelAnswer: res.modelAnswer || "",
+      sectionFeedback: res.sectionFeedback || null,
+      breakdown: res.breakdown || null
+    };
+  } catch (error) {
+    console.error("AI Essay Analysis Error:", error);
+    throw error;
+  }
+};
+
 export const analyzeWriting = async (userSummary: string, originalTranscript: string, taskType: string) => {
   try {
     const prompt = `
@@ -294,7 +635,7 @@ export const analyzeWriting = async (userSummary: string, originalTranscript: st
 
     const ai = getAI();
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+      model: "gemini-3.8-flash",
       contents: prompt,
       config: { 
         responseMimeType: "application/json",

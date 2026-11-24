@@ -3,7 +3,8 @@ import { View, Text, StyleSheet, TouchableOpacity, Modal, Alert, ScrollView, Ani
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { db, auth, ensureAuth } from '../services/firebase';
-import { collection, doc, setDoc, updateDoc, onSnapshot, query, where, orderBy, deleteDoc, getDocs } from 'firebase/firestore';
+import { collection, doc, setDoc, updateDoc, onSnapshot, query, where, deleteDoc, getDocs } from 'firebase/firestore';
+//import { collection, doc, setDoc, updateDoc, onSnapshot, query, where, orderBy, deleteDoc, getDocs } from 'firebase/firestore';
 import { networkService } from '../services/networkService';
 import { useTheme } from '../context/ThemeContext';
 import { REPEAT_SENTENCE_QUESTIONS } from '../constants/repeatSentenceData';
@@ -42,6 +43,8 @@ interface ParticipantResult {
   userId: string;
   userName: string;
   score: number;
+  accuracyScore?: number;
+  speedBonus?: number;
   timeTaken: number;
   completedRounds?: number;
   submittedAt?: number;
@@ -63,7 +66,10 @@ export const LiveSprint = () => {
   const [timeLeft, setTimeLeft] = useState(0);
   const [preStartCountdown, setPreStartCountdown] = useState(0);
   const [submittedRound, setSubmittedRound] = useState(-1);
+  const submissionLockRef = useRef<number | null>(null);
   const [myTotalScore, setMyTotalScore] = useState(0);
+  const [myTotalAccuracyScore, setMyTotalAccuracyScore] = useState(0);
+  const [myTotalSpeedBonus, setMyTotalSpeedBonus] = useState(0);
   const [myTotalTime, setMyTotalTime] = useState(0);
   const [currentQuestion, setCurrentQuestion] = useState<SprintQuestion | null>(null);
   const [selectedSprintAnswers, setSelectedSprintAnswers] = useState<string[]>([]);
@@ -180,6 +186,8 @@ export const LiveSprint = () => {
   useEffect(() => {
      if (activeSprint?.id !== lastSprintId.current) {
         setMyTotalScore(0);
+        setMyTotalAccuracyScore(0);
+        setMyTotalSpeedBonus(0);
         setMyTotalTime(0);
         setSubmittedRound(-1);
         lastSprintId.current = activeSprint?.id || null;
@@ -375,11 +383,36 @@ export const LiveSprint = () => {
     }
   }, [activeSprint?.id, activeSprint?.status]);
 
+  /*
   useEffect(() => {
+     
+    // OLD CODE — disabled for replacement
     if (activeSprint?.id) {
       const q = query(collection(db, `sprints/${activeSprint.id}/results`), orderBy('score', 'desc'), orderBy('timeTaken', 'asc'));
       const unsubscribe = onSnapshot(q, (snapshot) => {
         const res = snapshot.docs.map(d => d.data() as ParticipantResult);
+        setResults(res);
+      });
+      return () => unsubscribe();
+    } else {
+      setResults([]);
+    }
+  }, [activeSprint?.id]); */
+
+  // NEW CODE — fetch results and sort locally
+  
+  useEffect(() => {
+    if (activeSprint?.id) {
+      const q = query(collection(db, `sprints/${activeSprint.id}/results`));
+      const unsubscribe = onSnapshot(q, (snapshot) => {
+        const res = snapshot.docs.map(d => d.data() as ParticipantResult);
+
+        res.sort((a, b) => {
+          const scoreDifference = (Number(b.score) || 0) - (Number(a.score) || 0);
+          if (scoreDifference !== 0) return scoreDifference;
+          return (Number(a.timeTaken) || 0) - (Number(b.timeTaken) || 0);
+        });
+
         setResults(res);
       });
       return () => unsubscribe();
@@ -415,9 +448,10 @@ export const LiveSprint = () => {
             const isIndividual = activeSprint?.sessionType === 'individual';
             const isTimeUp = globalElapsed >= (activeSprint.duration || 30);
             let allAnswered = false;
+            const resultSavePending = submissionLockRef.current === currentRound;
             
             if (isIndividual) {
-                if (hasSubmitted) {
+                if (hasSubmitted && !resultSavePending) {
                     allAnswered = true;
                 }
             } else {
@@ -431,7 +465,9 @@ export const LiveSprint = () => {
                 }
             }
 
-            const shouldTransition = isIndividual ? (isTimeUp || allAnswered) : allAnswered;
+            const shouldTransition = isIndividual
+              ? ((isTimeUp && !resultSavePending) || allAnswered)
+              : allAnswered;
 
             if (globalElapsed >= 0 && shouldTransition) {
                 const nextRound = (activeSprint.currentRound || 0) + 1;
@@ -451,7 +487,7 @@ export const LiveSprint = () => {
       }, 1000);
     }
     return () => { if (checkInterval) clearInterval(checkInterval); };
-  }, [activeSprint, showGame, currentUid, results, hasSubmitted, clockOffset]);
+  }, [activeSprint, showGame, currentUid, results, hasSubmitted, clockOffset, myTotalScore, myTotalTime]);
 
   const handleAutoSubmit = () => {
     if (!hasSubmitted && activeSprint) {
@@ -462,9 +498,9 @@ export const LiveSprint = () => {
             });
             const totalBlanks = currentQuestion.correctAnswers?.length || 1;
             const finalScore = Math.round((correctCount / totalBlanks) * 100);
-            submitResult(finalScore, 30, currentRound);
+            submitResult(finalScore, activeSprint.duration || 30, currentRound);
         } else {
-            submitResult(0, 30, currentRound);
+            submitResult(0, activeSprint.duration || 30, currentRound);
         }
     }
   };
@@ -478,11 +514,16 @@ export const LiveSprint = () => {
     setLoading(true);
     setSubmittedRound(-1);
     setMyTotalScore(0);
+    setMyTotalAccuracyScore(0);
+    setMyTotalSpeedBonus(0);
     setMyTotalTime(0);
     setSelectedSprintAnswers([]);
     
     try {
-      await ensureAuth();
+      const sprintUser = await ensureAuth();
+      if (!sprintUser?.uid) {
+        throw new Error("Firebase authentication is not ready. Please try again.");
+      }
       const selectedQuestions: SprintQuestion[] = [];
       for(let i = 0; i < 5; i++) {
          const isRS = Math.random() > 0.5;
@@ -504,7 +545,7 @@ export const LiveSprint = () => {
       
       let safeSsidId = ssid ? ssid.replace(/[^a-zA-Z0-9]/g, '_') : 'unknown';
       if (type === 'individual') {
-         safeSsidId = `ind_${auth.currentUser?.uid || 'anon'}_${Date.now()}`;
+         safeSsidId = `ind_${sprintUser.uid}_${Date.now()}`;
       } else if (type === 'group') {
          const myGroupId = await import('../services/scoreService').then(m => m.scoreService.getGroupId());
          if (myGroupId) {
@@ -540,14 +581,14 @@ export const LiveSprint = () => {
       }
 
       const sprintData: any = {
-        hostId: auth.currentUser?.uid || 'anonymous',
+        hostId: sprintUser.uid,
         hostName: userName || 'Sprint',
         questions: selectedQuestions,
         currentRound: 0,
         participantCount: isIndividual ? 1 : 0,
         status: isIndividual ? 'running' : 'lobby',
         createdAt: getNow(),
-        duration: 30,
+        duration: isIndividual ? 15 : 30,
         ssid: ssid || 'Unknown',
         sessionType: type
       };
@@ -574,8 +615,13 @@ export const LiveSprint = () => {
        return;
     }
     try {
-        await setDoc(doc(db, `sprints/${networkGroupSprint.id}/participants`, currentUid || `anon_${getNow()}`), {
-            userId: currentUid || 'anon',
+        const participantUser = await ensureAuth();
+        if (!participantUser?.uid) {
+            throw new Error("Firebase authentication is not ready. Please try again.");
+        }
+
+        await setDoc(doc(db, `sprints/${networkGroupSprint.id}/participants`, participantUser.uid), {
+            userId: participantUser.uid,
             userName: userName || 'Student',
             isReady: true,
             joinedAt: getNow()
@@ -594,17 +640,24 @@ export const LiveSprint = () => {
       clearSprint();
     } else {
       try {
-        await deleteDoc(doc(db, `sprints/${activeSprint.id}/participants`, currentUid || 'anon'));
+        const participantUser = await ensureAuth();
+        if (!participantUser?.uid) {
+          throw new Error("Firebase authentication is not ready. Please try again.");
+        }
+
+        await deleteDoc(doc(db, `sprints/${activeSprint.id}/participants`, participantUser.uid));
+
+        setJoinedSprintId(null);
+        setActiveSprint(null);
+        setShowGame(false);
       } catch (e) {
         console.error(e);
+        Alert.alert("Error", "Could not leave the sprint. Please try again.");
       }
-      setJoinedSprintId(null);
-      setActiveSprint(null);
-      setShowGame(false);
     }
   };
-
-  const submitResult = async (roundScore: number, roundTimeSpent: number, forRound: number) => {
+  // The block below is replacing this block from const submitResult = async ( to };
+  /*const submitResult = async (roundScore: number, roundTimeSpent: number, forRound: number) => {
     if (!activeSprint || submittedRound === forRound) return;
     setSubmittedRound(forRound);
     
@@ -625,7 +678,80 @@ export const LiveSprint = () => {
     } catch (e) {
       console.log(e);
     }
-  };
+  };*/
+
+  const submitResult = async (
+  roundScore: number,
+  roundTimeSpent: number,
+  forRound: number
+) => {
+  if (
+  !activeSprint ||
+  submittedRound === forRound ||
+  submissionLockRef.current === forRound
+) {
+  return;
+}
+
+  // Prevent duplicate submissions while the save is in progress.
+  submissionLockRef.current = forRound;
+  setSubmittedRound(forRound);
+
+  const duration = Math.max(1, activeSprint.duration || 30);
+  const timeTaken = Math.max(0, Math.min(duration, roundTimeSpent));
+  const remainingTimeRatio = Math.max(0, (duration - timeTaken) / duration);
+  const speedBonus = roundScore > 0
+    ? Math.round(roundScore * 0.2 * remainingTimeRatio)
+    : 0;
+
+  const newAccuracyScore = myTotalAccuracyScore + roundScore;
+  const newSpeedBonus = myTotalSpeedBonus + speedBonus;
+  const newScore = myTotalScore + roundScore + speedBonus;
+  const newTime = myTotalTime + timeTaken;
+
+  try {
+    const resultUser = await ensureAuth();
+    if (!resultUser?.uid) {
+      throw new Error("Firebase authentication is not ready. Please try again.");
+    }
+
+    await setDoc(
+      doc(
+        db,
+        `sprints/${activeSprint.id}/results`,
+        resultUser.uid
+      ),
+      {
+        userId: resultUser.uid,
+        userName: userName || 'Student',
+        score: newScore,
+        accuracyScore: newAccuracyScore,
+        speedBonus: newSpeedBonus,
+        timeTaken: newTime,
+        completedRounds: currentRound + 1,
+        submittedAt: getNow()
+      },
+      { merge: true }
+    );
+
+    // Update totals only after Firestore confirms the save.
+    setMyTotalScore(newScore);
+    setMyTotalAccuracyScore(newAccuracyScore);
+    setMyTotalSpeedBonus(newSpeedBonus);
+    setMyTotalTime(newTime);
+    submissionLockRef.current = null;
+  } catch (e) {
+    console.error('Sprint Result Submission Error:', e);
+
+    // Allow the same round to be submitted again.
+    setSubmittedRound(-1);
+    submissionLockRef.current = null;
+    Alert.alert(
+      'Submission Failed',
+      'Your answer could not be saved. Please check your connection and try again.'
+    );
+  }
+};
 
   const clearSprint = async () => {
       if (!activeSprint) return;
@@ -884,7 +1010,7 @@ export const LiveSprint = () => {
                     {results.map((res, i) => (
                         <View key={i} style={styles.lbRow}>
                             <Text style={styles.lbName}>{i+1}. {res.userName}</Text>
-                            <Text style={styles.lbScore}>{res.timeTaken}s</Text>
+                            <Text style={styles.lbScore}>{res.score} pts · {res.timeTaken}s</Text>
                         </View>
                     ))}
                 </ScrollView>
@@ -1035,7 +1161,7 @@ export const LiveSprint = () => {
                                                         if (ans === currentQuestion.correctAnswers![i]) correctCount++;
                                                     });
                                                     const finalScore = Math.round((correctCount / currentQuestion.correctAnswers.length) * 100);
-                                                    submitResult(finalScore, 30 - timeLeft, currentRound);
+                                                    submitResult(finalScore, (activeSprint?.duration || 30) - timeLeft, currentRound);
                                                 }
                                             }}
                                         >
@@ -1051,7 +1177,7 @@ export const LiveSprint = () => {
                                     style={styles.optionBtn} 
                                     onPress={() => {
                                         const isCorrect = opt === currentQuestion?.text;
-                                        submitResult(isCorrect ? 100 : 0, 30 - timeLeft, currentRound);
+                                        submitResult(isCorrect ? 100 : 0, (activeSprint?.duration || 30) - timeLeft, currentRound);
                                     }}
                                 >
                                     <Text style={styles.optionText}>{opt}</Text>

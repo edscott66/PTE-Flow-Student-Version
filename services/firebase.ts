@@ -3,7 +3,8 @@ import { getFirestore, collection, doc, setDoc, getDocs, onSnapshot, query, orde
 import { 
   getAuth, 
   signInAnonymously, 
-  initializeAuth
+  initializeAuth,
+  type User
 } from 'firebase/auth';
 // @ts-ignore
 import { getReactNativePersistence } from 'firebase/auth';
@@ -87,14 +88,14 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
 }
 
 // Ensure anonymous auth for security rules if needed
-export const ensureAuth = async () => {
+export const ensureAuth = async (): Promise<User | null> => {
   // If already signed in, return immediately
   if (auth.currentUser) return auth.currentUser;
   
   // If auto-login is prevented (e.g. during logout/welcome), respect that if desired
   // However, for core functionality like checking activations, we usually NEED auth
   
-  return new Promise((resolve, reject) => {
+  return new Promise<User | null>((resolve, reject) => {
     const unsubscribe = auth.onAuthStateChanged(async (user) => {
       unsubscribe();
       if (user) {
