@@ -22,7 +22,7 @@ import { SUMMARIZE_SPOKEN_QUESTIONS } from '../../constants/summarizeSpokenData'
 import { WRITE_DICTATION_QUESTIONS } from '../../constants/writeDictationData';
 import { HIGHLIGHT_INCORRECT_QUESTIONS } from '../../constants/highlightIncorrectData';
 import { MULTIPLE_CHOICE_QUESTIONS } from '../../constants/multipleChoiceData';
-import { SUMMARIZE_WRITTEN_QUESTIONS } from '../../constants/summarizeWrittenData';
+import { SUMMARIZE_WRITTEN_QUESTIONS } from '../../constants/summarizeWrittenDataNew';
 import { RETELL_LECTURE_QUESTIONS } from '../../constants/retellLectureData';
 import { ANSWER_SHORT_QUESTION_DATA } from '../../constants/answerShortQuestionData';
 import { FILL_BLANKS_RW_QUESTIONS } from '../../constants/fillBlanksRWData';
@@ -36,7 +36,7 @@ import { SUMMARIZE_GROUP_QUESTIONS } from '../../constants/summarizeGroupData';
 import { RESPOND_SITUATION_QUESTIONS } from '../../constants/respondSituationData';
 import { db, auth, ensureAuth, handleFirestoreError, OperationType } from '../../services/firebase';
 import { collection, doc, setDoc, query, orderBy, limit, getDocs, where, increment, updateDoc, onSnapshot } from 'firebase/firestore';
-import { analyzeSpeech, analyzeWriting, analyzeEssay, synthesizeSpeech } from '../../services/geminiService';
+import { analyzeSpeech, analyzeWriting, analyzeSummarizeWritten, analyzeEssay, synthesizeSpeech } from '../../services/geminiService';
 import { scoreService } from '../../services/scoreService';
 import { networkService } from '../../services/networkService';
 import { Config } from '../../constants/config';
@@ -585,10 +585,25 @@ export default function ModuleScreen() {
   }, [id, startIndex, customConfig]);
   const [currentIndex, setCurrentIndex] = useState(() => {
     const requestedStartIndex = Number(startIndex);
-    return id === 'essay' && Number.isInteger(requestedStartIndex) && requestedStartIndex >= 0
+    return (id === 'essay' || id === 'summarize-written') &&
+      Number.isInteger(requestedStartIndex) &&
+      requestedStartIndex >= 0
       ? requestedStartIndex
       : 0;
   });
+  useEffect(() => {
+    if (id !== 'summarize-written' || questions.length === 0) return;
+
+    const requestedStartIndex = Number(startIndex);
+    if (
+      Number.isInteger(requestedStartIndex) &&
+      requestedStartIndex >= 0 &&
+      requestedStartIndex < questions.length
+    ) {
+      setCurrentIndex(requestedStartIndex);
+    }
+  }, [id, startIndex, questions.length]);
+
   const [bestScores, setBestScores] = useState<{[key: number]: number}>({});
   const [scoreFeedback, setScoreFeedback] = useState<{message: string, type: 'success' | 'info' | 'error'} | null>(null);
 
@@ -711,7 +726,7 @@ const animatedImageStyle = useAnimatedStyle<ImageStyle>(() => ({
 
   // Keep the active question visible in the horizontal section progress bar.
   useEffect(() => {
-    if (id === 'essay') {
+    if (id === 'essay' || id === 'summarize-written') {
       progressScrollRef.current?.scrollTo({
         x: Math.max(0, currentIndex * 46 - 100),
         animated: true,
@@ -1668,7 +1683,22 @@ const FeedbackRow = ({label, text, isIncorrect}: {label: string, text: string, i
     setMode('PROCESSING');
     try {
       const q = questions[currentIndex];
-      const res = await analyzeWriting(userSummary, isSummarizeWritten ? q.text : q.transcript, isSummarizeWritten ? "Summarize Written" : "Summarize Spoken");
+      let res: Awaited<ReturnType<typeof analyzeWriting>>;
+
+      if (isSummarizeWritten) {
+        const summarizeWrittenLevel = getEssayLevel(q.id);
+        if (!summarizeWrittenLevel) {
+          throw new Error(`Unable to determine the CEFR level for Summarize Written Text ID: ${q.id}`);
+        }
+        res = await analyzeSummarizeWritten(
+          userSummary,
+          q.text,
+          q.exampleAnswer,
+          summarizeWrittenLevel
+        );
+      } else {
+        res = await analyzeWriting(userSummary, q.transcript, "Summarize Spoken");
+      }
       
       if (res.breakdown) {
         await scoreService.updatePerformance({
@@ -2756,6 +2786,8 @@ const FeedbackRow = ({label, text, isIncorrect}: {label: string, text: string, i
                   if (!isLocked) {
                     if (task.id === 'essay') {
                       router.push('/module/essay-intro' as any);
+                    } else if (task.id === 'summarize-written') {
+                      router.push('/module/summarize-written-intro' as any);
                     } else {
                       router.push(`/module/${task.id}`);
                     }
@@ -2876,7 +2908,7 @@ const FeedbackRow = ({label, text, isIncorrect}: {label: string, text: string, i
             showsHorizontalScrollIndicator={false}
             contentContainerStyle={styles.jumpToScroll}
             onContentSizeChange={() => {
-              if (id === 'essay') {
+              if (id === 'essay' || id === 'summarize-written') {
                 progressScrollRef.current?.scrollTo({
                   x: Math.max(0, currentIndex * 46 - 100),
                   animated: false,
@@ -3415,7 +3447,9 @@ const FeedbackRow = ({label, text, isIncorrect}: {label: string, text: string, i
             </View>
             <ScrollView style={{maxHeight: 300}}>
               <Text style={styles.modelText}>
-                {questions[currentIndex]?.modelAnswer || "No model answer available."}
+                {(isSummarizeWritten
+                  ? questions[currentIndex]?.exampleAnswer
+                  : questions[currentIndex]?.modelAnswer) || "No model answer available."}
               </Text>
             </ScrollView>
           </View>
@@ -3605,4 +3639,3 @@ const FeedbackRow = ({label, text, isIncorrect}: {label: string, text: string, i
     </SafeAreaView>
   );
 }
-

@@ -597,6 +597,229 @@ export const analyzeEssay = async (
   }
 };
 
+/**
+ * Independently assess a Summarize Written Text response.
+ * This evaluator uses CEFR-appropriate English-learning criteria and does not
+ * use the shared PTE writing prompt used by Summarize Spoken Text.
+ */
+export const analyzeSummarizeWritten = async (
+  userSummary: string,
+  sourceText: string,
+  exampleAnswer: string,
+  level: 'A1' | 'A2' | 'B1' | 'B1+' | 'C1' | 'C2'
+) => {
+  try {
+    const isBeginnerLevel = level === 'A1' || level === 'A2';
+
+    const levelGuidance = isBeginnerLevel
+      ? `
+      LEARNER LEVEL: ${level}
+      Assess this as a beginner English learner.
+      Reward a clear understanding of the main message, even when the response
+      uses simple vocabulary and basic sentence structures.
+      Do not expect advanced vocabulary, complex grammar or sophisticated
+      sentence patterns. Give kind, supportive feedback in simple English.
+      `
+      : `
+      LEARNER LEVEL: ${level}
+      Assess the response at the expected ${level} level.
+      Consider precision, effective paraphrasing, grammar control, vocabulary
+      range and the ability to express connected ideas concisely.
+      Keep feedback clear, fair and practical.
+      `;
+
+    const prompt = `
+      Act as a fair, experienced English writing teacher specialising in
+      one-sentence summaries.
+
+      TASK: SUMMARIZE WRITTEN TEXT
+
+      ${levelGuidance}
+
+      SOURCE PASSAGE:
+      "${sourceText}"
+
+      APPROVED EXAMPLE ANSWER (REFERENCE ONLY):
+      "${exampleAnswer}"
+
+      STUDENT'S RESPONSE:
+      "${userSummary}"
+
+      IMPORTANT CONTENT-MARKING PRINCIPLES:
+      - Assess whether the student has understood and communicated the central
+        message and the most important supporting information in the passage.
+      - Use the approved example answer to understand the intended key meaning.
+        It is a guide, not a required wording or a fixed answer.
+      - Accept accurate paraphrases, synonyms and alternative sentence structures.
+      - Never require the student to copy the example answer.
+      - Do not penalise a response simply because it includes a different but
+        accurate selection or arrangement of key information.
+      - Do not award full content marks for a response that changes the main
+        meaning, includes important factual errors, or focuses on minor details
+        while missing the central message.
+      - Do not invent information that is not in the source passage.
+
+      FORM REQUIREMENTS:
+      - The response must contain 5 to 75 words.
+      - The response must be exactly one sentence.
+      - Assess these requirements fairly and reflect any failure in the Form score.
+      - Do not assess it as an essay or ask for paragraphs.
+
+      SCORING CRITERIA:
+      Score each category from 0 to 90, using expectations appropriate to ${level}.
+
+      1. CONTENT:
+         Accuracy and coverage of the passage's central message and important ideas.
+
+      2. FORM:
+         Compliance with the 5-75 word requirement and exactly one sentence.
+
+      3. GRAMMAR:
+         Sentence construction, tense, agreement, word order and punctuation.
+         Assess accuracy appropriate to the learner's level.
+
+      4. VOCABULARY:
+         Appropriate, accurate word choice and effective paraphrasing.
+         Do not demand unnecessarily advanced vocabulary.
+
+      5. SPELLING:
+         Correct spelling and appropriate written word forms.
+         Do not invent spelling errors.
+
+      6. STRUCTURE:
+         Clear organisation of the ideas within one coherent sentence.
+         Assess logical connections and readability, not paragraph structure.
+
+      7. LINGUISTIC RANGE:
+         The range and flexibility of vocabulary and sentence construction
+         appropriate to ${level}. A simple but accurate sentence can score well
+         at A1/A2.
+
+      OVERALL SCORE:
+      - Give a balanced overall learning-progress score from 0 to 90.
+      - Content and form are especially important for this task.
+      - Do not let sophisticated vocabulary hide missing or inaccurate content.
+      - Do not let minor language errors outweigh a response that communicates
+        the main meaning clearly.
+      - These scores are learning-progress indicators for this app, not official
+        examination scores.
+
+      FEEDBACK:
+      - Write a short overall summary in clear English.
+      - Give specific, useful feedback for each of the seven criteria.
+      - For A1/A2, use simple and encouraging language and focus on a small
+        number of achievable improvements.
+      - For higher levels, give more precise advice appropriate to the level.
+      - Each sectionFeedback item must discuss only its own criterion.
+      - Do not mention PTE, Pearson, official examination scores or a high-score
+        target.
+
+      MODEL ANSWER:
+      - Return the approved example answer exactly as supplied.
+      - Do not rewrite it or create a different model answer.
+
+      Return ONLY a valid JSON object with this structure:
+      {
+        "overall": number,
+        "feedback": string,
+        "sectionFeedback": {
+          "content": string,
+          "grammar": string,
+          "vocabulary": string,
+          "spelling": string,
+          "structure": string,
+          "form": string,
+          "linguisticRange": string
+        },
+        "breakdown": {
+          "grammar": number,
+          "vocabulary": number,
+          "spelling": number,
+          "content": number,
+          "structure": number,
+          "form": number,
+          "linguistic": number
+        }
+      }
+    `;
+
+    const ai = getAI();
+    const response = await ai.models.generateContent({
+      model: "gemini-3.8-flash",
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+        maxOutputTokens: 8000,
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            overall: { type: Type.NUMBER },
+            feedback: { type: Type.STRING },
+            sectionFeedback: {
+              type: Type.OBJECT,
+              properties: {
+                content: { type: Type.STRING },
+                grammar: { type: Type.STRING },
+                vocabulary: { type: Type.STRING },
+                spelling: { type: Type.STRING },
+                structure: { type: Type.STRING },
+                form: { type: Type.STRING },
+                linguisticRange: { type: Type.STRING }
+              },
+              required: [
+                "content",
+                "grammar",
+                "vocabulary",
+                "spelling",
+                "structure",
+                "form",
+                "linguisticRange"
+              ]
+            },
+            breakdown: {
+              type: Type.OBJECT,
+              properties: {
+                grammar: { type: Type.NUMBER },
+                vocabulary: { type: Type.NUMBER },
+                spelling: { type: Type.NUMBER },
+                content: { type: Type.NUMBER },
+                structure: { type: Type.NUMBER },
+                form: { type: Type.NUMBER },
+                linguistic: { type: Type.NUMBER }
+              },
+              required: [
+                "grammar",
+                "vocabulary",
+                "spelling",
+                "content",
+                "structure",
+                "form",
+                "linguistic"
+              ]
+            }
+          },
+          required: ["overall", "feedback", "sectionFeedback", "breakdown"]
+        }
+      }
+    });
+
+    let rawText = response.text || "{}";
+    rawText = rawText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+    const res = JSON.parse(rawText);
+
+    return {
+      overall: res.overall || 0,
+      feedback: res.feedback || "Summary assessment complete.",
+      modelAnswer: exampleAnswer,
+      sectionFeedback: res.sectionFeedback || null,
+      breakdown: res.breakdown || null
+    };
+  } catch (error) {
+    console.error("AI Summarize Written Analysis Error:", error);
+    throw error;
+  }
+};
+
 export const analyzeWriting = async (userSummary: string, originalTranscript: string, taskType: string) => {
   try {
     const prompt = `
